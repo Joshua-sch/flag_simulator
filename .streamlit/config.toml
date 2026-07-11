@@ -1,0 +1,6 @@
+[theme]
+primaryColor        = "#C9A84C"   # Linchris gold
+backgroundColor     = "#0F1B2D"   # Deep navy (page bg)
+secondaryBackgroundColor = "#1C2D4E"  # Medium navy (cards, uploaders, expanders)
+textColor           = "#FFFFFF"   # White
+font                = "sans serif"
