@@ -200,6 +200,21 @@ LABEL_RULES = [
     (lambda l: "room" in l and ("count" in l or "total" in l), "rooms"),
 ]
 
+# Plausibility bounds per field — STR reports pack multiple numeric columns
+# (current/prior period, % change, rank, comp-set value) after a label, so
+# the first number to the right of a match isn't reliably the right one.
+# Skipping implausible values (e.g. a bare year like 2024 mistaken for an
+# ADR) reduces — but doesn't eliminate — false matches on unfamiliar layouts.
+FIELD_RANGES = {
+    "comp_occ": (0.0, 100.0),
+    "comp_adr": (20.0, 900.0),
+    "transient_occ": (0.0, 100.0),
+    "group_occ": (0.0, 100.0),
+    "occ": (0.0, 100.0),
+    "adr": (20.0, 900.0),
+    "rooms": (1.0, 3000.0),
+}
+
 
 def parse_str_report(file_bytes: bytes, filename: str) -> dict:
     found = {}
@@ -223,9 +238,10 @@ def parse_str_report(file_bytes: bytes, filename: str) -> dict:
                 for check, field in LABEL_RULES:
                     if field in found or not check(label):
                         continue
+                    lo, hi = FIELD_RANGES[field]
                     for cc in range(c + 1, arr.shape[1]):
                         val = arr[r, cc]
-                        if isinstance(val, (int, float)) and not pd.isna(val):
+                        if isinstance(val, (int, float)) and not pd.isna(val) and lo <= val <= hi:
                             found[field] = float(val)
                             break
     return found
