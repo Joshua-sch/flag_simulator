@@ -28,19 +28,40 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 st.set_page_config(page_title="Flag Feasibility Simulator", layout="wide")
 
 # ===========================================================================
-# Defaults — Hotel 1620 Plymouth Harbor, May 2026 STR report
+# Per-hotel presets
+#
+# Hotel 1620: STR "Comp" tab (Running 12 Month) + BOB R12 report, both
+# trailing to May 2026. Inn at Middletown: STR "Comp" tab (Running 12 Month,
+# more accurate for total occupancy than the ROB tabs) for occ/ADR/comp set,
+# with the transient/group occupancy split derived from ROB's room-night mix
+# (averaged across its 2025 and 2026 trailing-year columns) since ROB doesn't
+# report a directly comparable total occupancy figure.
 # ===========================================================================
-PROPERTY_DEFAULTS = {
-    "hotel_name": "Hotel 1620",
-    "location": "Plymouth, MA",
-    "rooms": 177,
-    "occ": 42.37,
-    "adr": 181.37,
-    "transient_occ": 15.58,
-    "group_occ": 26.79,
-    "comp_occ": 59.87,
-    "comp_adr": 170.07,
+HOTEL_PRESETS = {
+    "Hotel 1620": {
+        "hotel_name": "Hotel 1620",
+        "location": "Plymouth, MA",
+        "rooms": 177,
+        "occ": 42.37,
+        "adr": 181.37,
+        "transient_occ": 15.58,
+        "group_occ": 26.79,
+        "comp_occ": 59.87,
+        "comp_adr": 170.07,
+    },
+    "Inn at Middletown": {
+        "hotel_name": "Inn at Middletown",
+        "location": "Middletown, CT",
+        "rooms": 100,
+        "occ": 47.18,
+        "adr": 219.44,
+        "transient_occ": 25.67,
+        "group_occ": 21.51,
+        "comp_occ": 57.74,
+        "comp_adr": 154.64,
+    },
 }
+PROPERTY_DEFAULTS = HOTEL_PRESETS["Hotel 1620"]
 
 FLAG_LABELS = {"hard": "Hard flag (Marriott / Hilton / IHG)", "soft": "Soft brand (Autograph / Tapestry / Vignette)"}
 VARIANT_ORDER = ["pessimistic", "base", "optimistic"]
@@ -157,6 +178,15 @@ def _blank_hotel_profile(name: str) -> dict:
     return profile
 
 
+def _preset_or_blank_profile(name: str) -> dict:
+    """A known preset (see HOTEL_PRESETS) starts pre-filled with its real
+    actuals; any other hotel name starts fully blank."""
+    profile = _blank_hotel_profile(name)
+    if name in HOTEL_PRESETS:
+        profile.update(HOTEL_PRESETS[name])
+    return profile
+
+
 def _snapshot_current_profile() -> dict:
     return {k: st.session_state[k] for k in ALL_KEYS}
 
@@ -171,7 +201,7 @@ def _switch_hotel(new_hotel: str):
     if old_hotel in st.session_state["hotel_profiles"]:
         st.session_state["hotel_profiles"][old_hotel] = _snapshot_current_profile()
     if new_hotel not in st.session_state["hotel_profiles"]:
-        st.session_state["hotel_profiles"][new_hotel] = _blank_hotel_profile(new_hotel)
+        st.session_state["hotel_profiles"][new_hotel] = _preset_or_blank_profile(new_hotel)
     _load_profile(st.session_state["hotel_profiles"][new_hotel])
     st.session_state["active_hotel"] = new_hotel
     st.session_state["hotel_selector"] = new_hotel
@@ -191,11 +221,15 @@ def _add_hotel():
     st.session_state["new_hotel_input"] = ""
 
 
-st.session_state.setdefault("hotel_list", ["Hotel 1620"])
+st.session_state.setdefault("hotel_list", list(HOTEL_PRESETS.keys()))
 st.session_state.setdefault("active_hotel", "Hotel 1620")
 st.session_state.setdefault("hotel_selector", st.session_state["active_hotel"])
 if "hotel_profiles" not in st.session_state:
-    st.session_state["hotel_profiles"] = {"Hotel 1620": _snapshot_current_profile()}
+    st.session_state["hotel_profiles"] = {
+        name: (_snapshot_current_profile() if name == st.session_state["active_hotel"]
+               else _preset_or_blank_profile(name))
+        for name in st.session_state["hotel_list"]
+    }
 
 
 # ===========================================================================
@@ -539,20 +573,34 @@ def parse_str_report(file_bytes: bytes, filename: str) -> dict:
     except Exception as e:
         return {"_error": str(e)}
 
+    def _sheet_priority(name: str) -> int:
+        # Lower number = processed first = wins ties via found.setdefault().
+        # "Comp" (Tab 4 Competitive Set, Running 12 Month) is a trailing-year
+        # figure and takes priority over plain "Glance" (current month), since
+        # a single month is a less representative snapshot than a full year.
+        lname = name.lower()
+        if "segmentation" in lname and "glance" in lname:
+            return 0
+        if "comp" in lname:
+            return 1
+        if "glance" in lname:
+            return 2
+        return 3
+
     found = {}
     matched_known_tab = False
-    for name in wb.sheetnames:
+    for name in sorted(wb.sheetnames, key=_sheet_priority):
         lname = name.lower()
         rows = None
         if "segmentation" in lname and "glance" in lname:
             rows = list(wb[name].iter_rows(values_only=True))
             partial = _parse_segmentation_glance_sheet(rows)
-        elif "glance" in lname:
-            rows = list(wb[name].iter_rows(values_only=True))
-            partial = _parse_glance_sheet(rows)
         elif "comp" in lname:
             rows = list(wb[name].iter_rows(values_only=True))
             partial = _parse_comp_set_report_sheet(rows)
+        elif "glance" in lname:
+            rows = list(wb[name].iter_rows(values_only=True))
+            partial = _parse_glance_sheet(rows)
         else:
             continue
         if partial:
