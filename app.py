@@ -988,48 +988,6 @@ tab_property, tab_scenarios, tab_results, tab_sensitivity, tab_summary = st.tabs
 # Tab 1 — Property & comp set
 # ---------------------------------------------------------------------------
 with tab_property:
-    st.markdown("**Actuals from ROB (optional — powers the Summary tab)**")
-    uploaded_rob = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx", "xls"], key="rob_uploader")
-    if uploaded_rob is not None:
-        rob_found = parse_rob_workbook(uploaded_rob.read())
-        if "_error" in rob_found:
-            st.error(f"Couldn't read that file: {rob_found['_error']}")
-        else:
-            _reset_keys(ROB_KEYS, value=None)
-            if rob_found:
-                for k, v in rob_found.items():
-                    st.session_state[k] = v
-                st.success(f"Cleared previous ROB actuals and pulled trailing {rob_found.get('rob_year', '')} "
-                           f"totals from {uploaded_rob.name} (sheet '{rob_found.get('rob_source_sheet', '')}') — "
-                           f"${rob_found.get('rob_total_revenue', 0):,.0f} total revenue.")
-            else:
-                st.warning("Couldn't find a recognizable TOTAL revenue section in that file. Previous ROB "
-                           "actuals were cleared.")
-
-    st.markdown("**Actuals from BOB (Business on the Books) — optional, full-year totals**")
-    uploaded_bob = st.file_uploader("Upload BOB report (.csv)", type=["csv"], key="bob_uploader")
-    if uploaded_bob is not None:
-        bob_found = parse_bob_report(uploaded_bob.read())
-        if "_error" in bob_found:
-            st.error(f"Couldn't read that file: {bob_found['_error']}")
-        else:
-            _reset_keys(PERFORMANCE_KEYS)
-            _reset_keys(ROB_KEYS, value=None)
-            if bob_found:
-                for f in PERFORMANCE_KEYS:
-                    if f in bob_found:
-                        st.session_state[f] = bob_found[f]
-                for k in ROB_KEYS:
-                    if k in bob_found:
-                        st.session_state[k] = bob_found[k]
-                st.success(f"Cleared previous performance/revenue metrics and pulled "
-                           f"{bob_found.get('rob_year', '')} totals from {uploaded_bob.name} — "
-                           f"${bob_found.get('rob_total_revenue', 0):,.0f} total revenue, "
-                           f"{bob_found.get('occ', 0):.1f}% occupancy.")
-            else:
-                st.warning("Couldn't find a recognizable TOTALS row in that BOB file. Previous performance/"
-                           "revenue metrics were cleared.")
-
     c1, c2 = st.columns(2)
     c1.text_input("Hotel name", key="hotel_name")
     c2.text_input("Location", key="location")
