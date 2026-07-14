@@ -30,24 +30,25 @@ st.set_page_config(page_title="Flag Feasibility Simulator", layout="wide")
 # ===========================================================================
 # Per-hotel presets
 #
-# Hotel 1620: STR "Comp" tab (Running 12 Month) + BOB R12 report, both
-# trailing to May 2026. Inn at Middletown: STR "Comp" tab (Running 12 Month,
-# more accurate for total occupancy than the ROB tabs) for occ/ADR/comp set,
-# with the transient/group occupancy split derived from ROB's room-night mix
-# (averaged across its 2025 and 2026 trailing-year columns) since ROB doesn't
-# report a directly comparable total occupancy figure.
+# Both hotels use the same approach: total occ/ADR/comp set come from the STR
+# "Comp" tab (Running 12 Month, trailing to May 2026) since that's the more
+# accurate total-occupancy source; the transient/group split is derived from
+# the *proportional shares* of the secondary source (BOB room-night mix for
+# 1620, ROB room-night mix averaged across its 2025/2026 columns for
+# Middletown) scaled onto the STR total, since neither BOB nor ROB's own
+# total-occupancy figure matched STR's as closely.
 # ===========================================================================
 HOTEL_PRESETS = {
     "Hotel 1620": {
         "hotel_name": "Hotel 1620",
         "location": "Plymouth, MA",
         "rooms": 177,
-        "occ": 42.37,
-        "adr": 181.37,
-        "transient_occ": 15.58,
-        "group_occ": 26.79,
-        "comp_occ": 59.87,
-        "comp_adr": 170.07,
+        "occ": 49.86,
+        "adr": 186.50,
+        "transient_occ": 22.02,
+        "group_occ": 27.72,
+        "comp_occ": 57.15,
+        "comp_adr": 172.88,
     },
     "Inn at Middletown": {
         "hotel_name": "Inn at Middletown",
