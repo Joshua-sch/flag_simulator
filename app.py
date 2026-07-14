@@ -28,12 +28,12 @@ PROPERTY_DEFAULTS = {
     "hotel_name": "Hotel 1620",
     "location": "Plymouth, MA",
     "rooms": 177,
-    "occ": 42.4,
-    "adr": 181.0,
-    "transient_occ": 20.8,
-    "group_occ": 57.5,
-    "comp_occ": 59.9,
-    "comp_adr": 170.0,
+    "occ": 42.37,
+    "adr": 181.37,
+    "transient_occ": 15.58,
+    "group_occ": 26.79,
+    "comp_occ": 59.87,
+    "comp_adr": 170.07,
 }
 
 FLAG_LABELS = {"hard": "Hard flag (Marriott / Hilton / IHG)", "soft": "Soft brand (Autograph / Tapestry / Vignette)"}
@@ -188,7 +188,19 @@ def run_all_scenarios():
 
 
 # ===========================================================================
-# STR report heuristic parser
+# STR report parser
+#
+# Standard STR "STAR Report" workbooks (as exported for LinChris properties)
+# carry a fixed set of named tabs. The "Glance" tab ("Monthly Performance at
+# a Glance") and "Segmentation Glance" tab ("Segmentation at a Glance") both
+# use a two-level header: a metric-group row (Occupancy (%) / ADR / RevPAR,
+# or Transient / Group / Contract / Total) followed by a sub-header row
+# (My Prop / Comp Set / Index, or My Property), with data rows labeled
+# Current Month / Year To Date / etc. We locate values by walking that
+# header structure rather than assuming fixed cell coordinates, since column
+# widths shift slightly between properties/exports. A generic label-scan
+# heuristic (with plausibility-range guards) is kept as a fallback for CSVs
+# and any workbook that doesn't match this tab layout.
 # ===========================================================================
 LABEL_RULES = [
     (lambda l: "occupancy" in l and "comp" in l, "comp_occ"),
@@ -216,34 +228,167 @@ FIELD_RANGES = {
 }
 
 
-def parse_str_report(file_bytes: bytes, filename: str) -> dict:
+def _generic_label_scan(arr) -> dict:
     found = {}
+    for r in range(arr.shape[0]):
+        for c in range(arr.shape[1]):
+            cell = arr[r, c]
+            if not isinstance(cell, str):
+                continue
+            label = cell.lower().strip()
+            for check, field in LABEL_RULES:
+                if field in found or not check(label):
+                    continue
+                lo, hi = FIELD_RANGES[field]
+                for cc in range(c + 1, arr.shape[1]):
+                    val = arr[r, cc]
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        continue
+                    try:
+                        fval = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if lo <= fval <= hi:
+                        found[field] = fval
+                        break
+    return found
+
+
+def _parse_glance_sheet(rows) -> dict:
+    """'Monthly Performance at a Glance' tab: Occupancy (%) / ADR / RevPAR
+    group headers, My Prop / Comp Set / Index sub-headers, Current Month row."""
+    group_row_idx = next(
+        (i for i, row in enumerate(rows)
+         if any(isinstance(v, str) and v.strip().lower() == "occupancy (%)" for v in row)),
+        None,
+    )
+    if group_row_idx is None:
+        return {}
+    group_row = rows[group_row_idx]
+    groups = {v.strip().lower(): i for i, v in enumerate(group_row) if isinstance(v, str) and v.strip()}
+
+    sub_row = next(
+        (rows[j] for j in range(group_row_idx + 1, min(group_row_idx + 4, len(rows)))
+         if any(isinstance(v, str) and v.strip().lower() in ("my prop", "my property") for v in rows[j])),
+        None,
+    )
+    if sub_row is None:
+        return {}
+
+    data_row = next(
+        (rows[j] for j in range(group_row_idx, min(group_row_idx + 15, len(rows)))
+         if any(isinstance(v, str) and v.strip().lower() == "current month" for v in rows[j])),
+        None,
+    )
+    if data_row is None:
+        return {}
+
+    def find_val(group_key, subcol_substrs):
+        gcol = groups.get(group_key)
+        if gcol is None:
+            return None
+        for k in range(gcol, min(gcol + 6, len(sub_row))):
+            sv = sub_row[k]
+            if isinstance(sv, str) and any(s in sv.lower() for s in subcol_substrs):
+                if k < len(data_row) and isinstance(data_row[k], (int, float)):
+                    return float(data_row[k])
+        return None
+
+    out = {}
+    for field, group_key, subcols in [
+        ("occ", "occupancy (%)", ["my prop"]),
+        ("comp_occ", "occupancy (%)", ["comp set"]),
+        ("adr", "adr", ["my prop"]),
+        ("comp_adr", "adr", ["comp set"]),
+    ]:
+        val = find_val(group_key, subcols)
+        if val is not None:
+            out[field] = val
+    return out
+
+
+def _parse_segmentation_glance_sheet(rows) -> dict:
+    """'Segmentation at a Glance' tab: Transient / Group / Contract / Total
+    column groups, with an Occupancy (%) row block carrying My Property
+    values inline (segment breakdown has no separate comp-set column)."""
+    group_row_idx = next(
+        (i for i, row in enumerate(rows)
+         if any(isinstance(v, str) and v.strip().lower() == "transient" for v in row)
+         and any(isinstance(v, str) and v.strip().lower() == "group" for v in row)),
+        None,
+    )
+    if group_row_idx is None:
+        return {}
+    group_row = rows[group_row_idx]
+    groups = {v.strip().lower(): i for i, v in enumerate(group_row) if isinstance(v, str) and v.strip()}
+
+    occ_row = next(
+        (rows[j] for j in range(group_row_idx + 1, min(group_row_idx + 4, len(rows)))
+         if any(isinstance(v, str) and v.strip().lower() == "occupancy (%)" for v in rows[j])),
+        None,
+    )
+    if occ_row is None:
+        return {}
+
+    def find_val_in_row(row, gcol):
+        for k in range(gcol, min(gcol + 4, len(row))):
+            if isinstance(row[k], (int, float)):
+                return float(row[k])
+        return None
+
+    out = {}
+    if "transient" in groups:
+        val = find_val_in_row(occ_row, groups["transient"])
+        if val is not None:
+            out["transient_occ"] = val
+    if "group" in groups:
+        val = find_val_in_row(occ_row, groups["group"])
+        if val is not None:
+            out["group_occ"] = val
+    return out
+
+
+def parse_str_report(file_bytes: bytes, filename: str) -> dict:
+    if filename.lower().endswith(".csv"):
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=object)
+        except Exception as e:
+            return {"_error": str(e)}
+        return _generic_label_scan(df.to_numpy())
+
     try:
-        if filename.lower().endswith(".csv"):
-            sheets = {"csv": pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=object)}
-        else:
-            wb = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, engine="openpyxl")
-            sheets = wb
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     except Exception as e:
         return {"_error": str(e)}
 
-    for _, df in sheets.items():
-        arr = df.to_numpy()
-        for r in range(arr.shape[0]):
-            for c in range(arr.shape[1]):
-                cell = arr[r, c]
-                if not isinstance(cell, str):
-                    continue
-                label = cell.lower().strip()
-                for check, field in LABEL_RULES:
-                    if field in found or not check(label):
-                        continue
-                    lo, hi = FIELD_RANGES[field]
-                    for cc in range(c + 1, arr.shape[1]):
-                        val = arr[r, cc]
-                        if isinstance(val, (int, float)) and not pd.isna(val) and lo <= val <= hi:
-                            found[field] = float(val)
-                            break
+    found = {}
+    matched_known_tab = False
+    for name in wb.sheetnames:
+        lname = name.lower()
+        rows = None
+        if "segmentation" in lname and "glance" in lname:
+            rows = list(wb[name].iter_rows(values_only=True))
+            partial = _parse_segmentation_glance_sheet(rows)
+        elif "glance" in lname:
+            rows = list(wb[name].iter_rows(values_only=True))
+            partial = _parse_glance_sheet(rows)
+        else:
+            continue
+        if partial:
+            matched_known_tab = True
+        for k, v in partial.items():
+            found.setdefault(k, v)
+
+    if not matched_known_tab:
+        # Not a recognized STR "STAR Report" export — fall back to a
+        # generic scan of every sheet using the label-proximity heuristic.
+        for name in wb.sheetnames:
+            arr = np.array(list(wb[name].iter_rows(values_only=True)), dtype=object)
+            if arr.size == 0:
+                continue
+            for k, v in _generic_label_scan(arr).items():
+                found.setdefault(k, v)
+
     return found
 
 
