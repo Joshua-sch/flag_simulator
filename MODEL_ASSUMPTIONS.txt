@@ -1,0 +1,139 @@
+FLAG FEASIBILITY SIMULATOR — MODEL ASSUMPTIONS
+LinChris Capital
+=====================================================
+
+This document summarizes every assumption built into the Flag Feasibility
+Simulator: where the underlying actuals came from, how the model turns
+those actuals into projected outcomes, and the specific default numbers
+currently in use for Hotel 1620 and Inn at Middletown.
+
+
+1. DATA SOURCES (per property)
+-------------------------------
+
+Hotel 1620 (Plymouth Harbor, Plymouth MA — 177 rooms)
+  - Occupancy, ADR, and comp-set benchmarks: STR "Tab 4 — Competitive Set
+    Report," Running 12 Month column (trailing to May 2026). This is the
+    most representative full-year figure available, rather than a single
+    month's snapshot.
+  - Group vs. transient occupancy split: derived from the BOB (Business on
+    the Books) report, Running 12 Month (Jun 2025–May 2026), using the
+    actual room-night mix (group rooms sold vs. individual rooms sold as a
+    share of total rooms sold). That proportion is then applied to the
+    STR-sourced total occupancy figure, since STR and BOB's own total
+    occupancy numbers didn't match exactly (STR is treated as the more
+    reliable total).
+
+Inn at Middletown (Middletown, CT — 100 rooms)
+  - Occupancy, ADR, and comp-set benchmarks: same STR "Comp" tab, Running
+    12 Month methodology as Hotel 1620.
+  - Group vs. transient occupancy split: derived from the ROB Master
+    Workbook's revenue split (group vs. transient revenue), averaged across
+    its two available trailing-year columns, converted to a room-night
+    proportion and applied to the STR total occupancy figure the same way
+    as 1620.
+
+Bottom line: for both properties, STR determines "how big is the pie"
+(total occupancy, ADR, comp set), and the property-specific revenue system
+(BOB for 1620, ROB for Middletown) determines "how the pie splits" between
+group and transient business.
+
+
+2. CURRENT ACTUALS BAKED INTO THE MODEL
+-----------------------------------------
+
+                          Hotel 1620        Inn at Middletown
+Rooms                     177               100
+Occupancy                 49.86%            47.18%
+Comp set occupancy        57.15%            57.74%
+ADR                       $186.50           $219.44
+Comp set ADR              $172.88           $154.64
+Transient occupancy       22.02%            25.67%
+Group occupancy           27.72%            21.51%
+Gap to comp set            7.29 pp          10.56 pp
+
+(Every field above is editable in the app — these are the current defaults,
+not hardcoded ceilings.)
+
+
+3. HOW THE MODEL PROJECTS EACH FLAG SCENARIO
+-----------------------------------------------
+
+For each flag type (Hard: Marriott/Hilton/IHG-tier; Soft: Autograph/
+Tapestry/Vignette-tier), the model takes five base-case assumptions you set
+directly:
+  - Franchise + royalty fee (% of gross revenue)
+  - Expected transient occupancy lift (percentage points)
+  - Expected group occupancy lift (percentage points)
+  - ADR impact (%)
+  - PIP (property improvement plan) cost per room
+
+From that single base case, "Optimistic" and "Underperforming" variants are
+generated automatically (not independently estimated):
+
+  * Transient/group lift swing ±50% of their own value (so hard flag's
+    +12pp base becomes +18pp optimistic / +6pp underperforming)
+  * Fee multiplies ×0.85 (optimistic) / ×1.15 (pessimistic)
+  * PIP cost multiplies ×0.70 (optimistic) / ×1.30 (pessimistic)
+  * ADR impact swings by a flat ±2.5 percentage points
+
+Then revenue = (base transient occ + lift) × room-nights × ADR, same for
+group, minus fee% of gross, minus PIP:
+
+  - Room-nights available = rooms × 365
+  - Transient revenue = (current transient occ% + transient lift) ×
+    room-nights × scenario ADR
+  - Group revenue = (current group occ% + group lift) × room-nights ×
+    scenario ADR
+  - Gross revenue = transient + group revenue
+  - Fee cost = gross revenue × franchise fee %
+  - PIP cost = (PIP $/room × rooms) amortized straight-line over the
+    chosen number of years (7 years by default)
+  - Net revenue = gross revenue − fee cost − amortized PIP cost
+  - This is compared against "Stay Independent" (current actuals, zero fee,
+    zero PIP) to get net revenue vs. baseline, and a payback period in years
+    is calculated from the PIP cost vs. annual incremental net revenue.
+
+Current default flag assumptions (base case, both properties start here —
+fully editable per property):
+
+  Hard flag:  11.0% fee | +12.0pp transient lift | +0.0pp group lift |
+              −3.0% ADR impact | $18,000/room PIP
+  Soft brand:  7.0% fee | +6.0pp transient lift  | +0.0pp group lift |
+              +1.0% ADR impact | $7,500/room PIP
+  PIP amortization period: 7 years (default, adjustable 1–20 years)
+
+
+4. KEY STRUCTURAL ASSUMPTIONS / LIMITATIONS
+-----------------------------------------------
+
+  - Group occupancy lift defaults to 0pp for both flag types — the model
+    assumes group/meetings business is relationship- and market-driven, not
+    brand-driven, and is held flat unless you explicitly set a group lift.
+  - Transient and group segments are assumed to earn the SAME ADR in the
+    revenue math — there's no separate transient-rate vs. group-rate
+    assumption. (This means how you split an occupancy gain between
+    transient/group doesn't change total revenue, only which line item it
+    shows up under.)
+  - There is currently no linkage between PIP dollars spent and how much
+    occupancy or ADR actually improves — the occupancy lift and PIP cost
+    are set independently by you, not tied to each other by a formula.
+  - The occupancy-lift assumptions (the +12pp/+6pp defaults above) are
+    manually set, not derived from the comp-set occupancy gap. We discussed
+    and tested (outside the live app, not yet built in) an alternative
+    approach that ties expected occupancy lift to a defined percentage of
+    the actual gap to comp set — that version is not implemented in the
+    tool as of this writing.
+  - Comp-set figures (occupancy/ADR) are currently informational/display
+    only in the app — they are not yet wired into the revenue projections.
+
+
+5. WHAT'S EDITABLE VS. FIXED
+--------------------------------
+  Editable per property, live in the app: room count, current occupancy/
+  ADR/comp set, transient/group split, all five base-case flag assumptions
+  per flag type, PIP amortization period.
+
+  Fixed by the model's internal formulas (not user-facing sliders): the
+  ±50% optimistic/underperforming swing rule, the fee/PIP multiplier
+  ranges, and the ADR swing of ±2.5pp described in Section 3.
