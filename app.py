@@ -18,6 +18,11 @@ import pandas as pd
 import openpyxl
 import altair as alt
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="Flag Feasibility Simulator", layout="wide")
 
@@ -88,6 +93,10 @@ def derive_variant_params(base_params: dict, variant: str) -> dict:
 # ===========================================================================
 # Session state — widget keys double as the persistence schema
 # ===========================================================================
+ROB_KEYS = ["rob_year", "rob_total_revenue", "rob_room_nights", "rob_group_revenue",
+            "rob_transient_revenue", "rob_source_sheet"]
+
+
 def init_state():
     for k, v in PROPERTY_DEFAULTS.items():
         st.session_state.setdefault(k, v)
@@ -95,12 +104,15 @@ def init_state():
     for flag, params in FLAG_BASE_DEFAULTS.items():
         for param, val in params.items():
             st.session_state.setdefault(f"{flag}_{param}", val)
+    for k in ROB_KEYS:
+        st.session_state.setdefault(k, None)
 
 
 ALL_KEYS = (
     list(PROPERTY_DEFAULTS.keys())
     + ["amort_years"]
     + [f"{flag}_{param}" for flag, params in FLAG_BASE_DEFAULTS.items() for param in params]
+    + ROB_KEYS
 )
 
 init_state()
@@ -410,6 +422,132 @@ def parse_str_report(file_bytes: bytes, filename: str) -> dict:
 
 
 # ===========================================================================
+# ROB (Revenue on the Books) workbook parser
+#
+# ROB Master Workbooks carry six week-snapshot tabs ("wk one" .. "wk six")
+# for a given reporting month; each is a point-in-time pull, so later tabs
+# should show more picked-up revenue than earlier ones. In practice not
+# every tab is populated for a given month (e.g. "wk six" may be a stale
+# leftover with a different, unrelated layout) — rather than trust tab
+# order, we take the tab with the highest trailing-year TOTAL revenue,
+# since pickup only accumulates over time.
+# ===========================================================================
+def parse_rob_workbook(file_bytes: bytes) -> dict:
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        return {"_error": str(e)}
+
+    candidates = []
+    for name in wb.sheetnames:
+        rows = list(wb[name].iter_rows(values_only=True))
+        total_row_idx, year_col_map = None, None
+        for i, row in enumerate(rows):
+            if row and isinstance(row[0], str) and row[0].strip().upper() == "TOTAL":
+                year_cols = {int(v): j for j, v in enumerate(row) if isinstance(v, (int, float)) and 2000 <= v <= 2100}
+                if year_cols:
+                    total_row_idx, year_col_map = i, year_cols
+                    break
+        if total_row_idx is None:
+            continue
+
+        revenue_row = rows[total_row_idx + 1] if total_row_idx + 1 < len(rows) else None
+        roomnights_row = rows[total_row_idx + 2] if total_row_idx + 2 < len(rows) else None
+        if not (revenue_row and isinstance(revenue_row[0], str) and revenue_row[0].strip().upper() == "REVENUE"):
+            continue
+
+        latest_year = max(year_col_map)
+        col = year_col_map[latest_year]
+        total_revenue = revenue_row[col] if col < len(revenue_row) else None
+        if not isinstance(total_revenue, (int, float)):
+            continue
+        room_nights = roomnights_row[col] if roomnights_row and col < len(roomnights_row) else None
+
+        group_revenue = None
+        for j in range(total_row_idx, min(total_row_idx + 12, len(rows))):
+            r = rows[j]
+            if r and isinstance(r[0], str) and r[0].strip().upper() == "TOTAL GROUP":
+                grp_rev_row = rows[j + 1] if j + 1 < len(rows) else None
+                if (grp_rev_row and isinstance(grp_rev_row[0], str) and grp_rev_row[0].strip().upper() == "REVENUE"
+                        and col < len(grp_rev_row) and isinstance(grp_rev_row[col], (int, float))):
+                    group_revenue = grp_rev_row[col]
+                break
+
+        candidates.append({
+            "sheet": name, "year": latest_year, "total_revenue": float(total_revenue),
+            "room_nights": float(room_nights) if isinstance(room_nights, (int, float)) else None,
+            "group_revenue": float(group_revenue) if group_revenue is not None else None,
+        })
+
+    if not candidates:
+        return {}
+    best = max(candidates, key=lambda c: c["total_revenue"])
+    out = {
+        "rob_year": best["year"],
+        "rob_total_revenue": best["total_revenue"],
+        "rob_source_sheet": best["sheet"],
+    }
+    if best["room_nights"] is not None:
+        out["rob_room_nights"] = best["room_nights"]
+    if best["group_revenue"] is not None:
+        out["rob_group_revenue"] = best["group_revenue"]
+        out["rob_transient_revenue"] = best["total_revenue"] - best["group_revenue"]
+    return out
+
+
+# ===========================================================================
+# Soft-flag breakeven calculation
+#
+# Holding group revenue and ADR flat, how much would transient revenue need
+# to grow for a flag conversion to break even at a given fee rate? The fee
+# applies to *total* revenue (including the group revenue you already have),
+# so growing transient revenue also raises the fee bill on that group piece:
+#   breakeven ΔT = (fee × current_gross_revenue + annualized_PIP) / (1 - fee)
+# ===========================================================================
+def compute_breakeven(current_gross_revenue, current_transient_revenue, fee_pct, pip_per_room, rooms, amort_years):
+    fee = fee_pct / 100.0
+    pip_annual = (pip_per_room * rooms) / amort_years if amort_years > 0 else 0.0
+    delta_t = (fee * current_gross_revenue + pip_annual) / (1 - fee) if fee < 1 else float("inf")
+    pct_increase = (delta_t / current_transient_revenue * 100.0) if current_transient_revenue > 0 else None
+    return {
+        "pip_annual": pip_annual,
+        "delta_t": delta_t,
+        "pct_increase": pct_increase,
+        "breakeven_transient_revenue": current_transient_revenue + delta_t,
+    }
+
+
+def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdict) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                             leftMargin=0.7 * inch, rightMargin=0.7 * inch)
+    styles = getSampleStyleSheet()
+    elements = [
+        Paragraph("Flag Feasibility Summary", styles["Title"]),
+        Paragraph(f"{hotel_name} — {location} ({rooms} rooms)", styles["Normal"]),
+        Paragraph(f"Revenue source: {source_label}", styles["Normal"]),
+        Spacer(1, 16),
+    ]
+    for title, rows in sections:
+        elements.append(Paragraph(title, styles["Heading2"]))
+        table = Table(rows, colWidths=[3.2 * inch, 2.6 * inch])
+        table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#333333")),
+            ("FONTNAME", (1, 0), (1, -1), "Helvetica-Bold"),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 14))
+    elements.append(Paragraph(verdict, styles["Normal"]))
+    doc.build(elements)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ===========================================================================
 # UI — header
 # ===========================================================================
 st.markdown(
@@ -453,8 +591,8 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
 
-tab_property, tab_scenarios, tab_results, tab_sensitivity = st.tabs(
-    ["1 · Property & comp set", "2 · Flag scenarios", "3 · Results", "4 · Sensitivity"]
+tab_property, tab_scenarios, tab_results, tab_sensitivity, tab_summary = st.tabs(
+    ["1 · Property & comp set", "2 · Flag scenarios", "3 · Results", "4 · Sensitivity", "5 · Summary"]
 )
 
 # ---------------------------------------------------------------------------
@@ -483,6 +621,21 @@ with tab_property:
                 st.warning(f"Couldn't auto-detect fields in {uploaded_str.name}. Enter values manually below.")
         else:
             st.warning("No recognizable STR fields found. Enter values manually below.")
+
+    st.markdown("**Actuals from ROB (optional — powers the Summary tab)**")
+    uploaded_rob = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx", "xls"], key="rob_uploader")
+    if uploaded_rob is not None:
+        rob_found = parse_rob_workbook(uploaded_rob.read())
+        if "_error" in rob_found:
+            st.error(f"Couldn't read that file: {rob_found['_error']}")
+        elif rob_found:
+            for k, v in rob_found.items():
+                st.session_state[k] = v
+            st.success(f"Pulled trailing {rob_found.get('rob_year', '')} totals from {uploaded_rob.name} "
+                       f"(sheet '{rob_found.get('rob_source_sheet', '')}') — "
+                       f"${rob_found.get('rob_total_revenue', 0):,.0f} total revenue.")
+        else:
+            st.warning("Couldn't find a recognizable TOTAL revenue section in that file.")
 
     c1, c2 = st.columns(2)
     c1.text_input("Hotel name", key="hotel_name")
@@ -707,3 +860,112 @@ with tab_sensitivity:
     ).properties(height=520, title=f"Net revenue vs. baseline — fee × occupancy lift ({FLAG_LABELS[sens_flag]})")
     st.altair_chart(heatmap, width="stretch")
     st.caption("Green = flag beats staying independent at that fee/lift combination; red = it doesn't. The break-even line runs roughly diagonally — higher fees require proportionally more occupancy lift to pay for themselves.")
+
+# ---------------------------------------------------------------------------
+# Tab 5 — Summary
+# ---------------------------------------------------------------------------
+with tab_summary:
+    st.markdown("A simple one-page snapshot: hard actuals, the soft-flag breakeven threshold, and how the current soft-flag base-case assumptions stack up against it.")
+
+    rooms = st.session_state["rooms"]
+    room_nights = rooms * 365
+    amort_years = st.session_state["amort_years"]
+
+    if st.session_state.get("rob_total_revenue"):
+        source_label = f"ROB actuals (trailing {st.session_state.get('rob_year', '')}, sheet '{st.session_state.get('rob_source_sheet', '')}')"
+        current_gross = st.session_state["rob_total_revenue"]
+        current_transient = st.session_state.get("rob_transient_revenue")
+        current_group = st.session_state.get("rob_group_revenue")
+        if current_transient is None:
+            current_transient = room_nights * (st.session_state["transient_occ"] / 100.0) * st.session_state["adr"]
+            current_group = current_gross - current_transient
+    else:
+        source_label = "STR-derived (current month occupancy × ADR, annualized — upload a ROB workbook in tab 1 for full-year actuals)"
+        current_gross = room_nights * (st.session_state["occ"] / 100.0) * st.session_state["adr"]
+        current_transient = room_nights * (st.session_state["transient_occ"] / 100.0) * st.session_state["adr"]
+        current_group = current_gross - current_transient
+
+    st.caption(f"Revenue source: {source_label}")
+
+    soft_fee = st.session_state["soft_fee"]
+    soft_pip = st.session_state["soft_pip_per_room"]
+    be = compute_breakeven(current_gross, current_transient, soft_fee, soft_pip, rooms, amort_years)
+    occ_pp_equiv = be["delta_t"] / (room_nights * st.session_state["adr"]) * 100.0 if st.session_state["adr"] > 0 else None
+
+    soft_base = results["soft_base"]
+    baseline_r = results["stay_independent"]
+    transient_ratio = (soft_base["transient_revenue"] / baseline_r["transient_revenue"]
+                        if baseline_r["transient_revenue"] else 1.0)
+    group_ratio = (soft_base["group_revenue"] / baseline_r["group_revenue"]
+                   if baseline_r["group_revenue"] else 1.0)
+    projected_transient = current_transient * transient_ratio
+    projected_group = current_group * group_ratio
+    projected_gross = projected_transient + projected_group
+
+    soft_params = soft_base["params"]
+    projected_fee_cost = projected_gross * soft_params["fee"] / 100.0
+    projected_pip_annual = (soft_params["pip_per_room"] * rooms) / amort_years if amort_years > 0 else 0.0
+    projected_net = projected_gross - projected_fee_cost - projected_pip_annual
+    projected_net_vs_current = projected_net - current_gross
+    projected_delta_t = projected_transient - current_transient
+    gap = projected_delta_t - be["delta_t"]
+
+    if gap >= 0:
+        verdict = (f"Soft flag base-case assumptions project a transient revenue increase of ${projected_delta_t:,.0f}, "
+                   f"which clears the ${be['delta_t']:,.0f} breakeven bar by ${gap:,.0f}.")
+    else:
+        verdict = (f"Soft flag base-case assumptions project a transient revenue increase of ${projected_delta_t:,.0f}, "
+                   f"which falls short of the ${be['delta_t']:,.0f} breakeven bar by ${abs(gap):,.0f}.")
+
+    st.markdown(
+        f"""<div style="background:#1C2D4E;border:1px solid #2A3D63;border-radius:10px;padding:1rem 1.25rem;margin:0.5rem 0 1.25rem;">
+        {verdict}</div>""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("#### Current performance (actuals)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Annual gross revenue", f"${current_gross:,.0f}")
+    c2.metric("Annual transient revenue", f"${current_transient:,.0f}")
+    c3.metric("Annual group revenue", f"${current_group:,.0f}")
+
+    st.markdown(f"#### Soft flag breakeven (at {soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Annualized PIP cost", f"${be['pip_annual']:,.0f}")
+    c2.metric("Transient revenue increase needed", f"${be['delta_t']:,.0f}",
+              f"+{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else None)
+    c3.metric("Occupancy-point equivalent", f"≈{occ_pp_equiv:.1f} pp" if occ_pp_equiv is not None else "—")
+
+    st.markdown("#### Projected outcome (soft flag base case)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Projected transient revenue", f"${projected_transient:,.0f}", f"+${projected_delta_t:,.0f}")
+    c2.metric("Projected gross revenue", f"${projected_gross:,.0f}")
+    c3.metric("Projected net vs. current", f"${projected_net_vs_current:,.0f}")
+
+    pdf_sections = [
+        ("Current performance (actuals)", [
+            ["Annual gross revenue", f"${current_gross:,.0f}"],
+            ["Annual transient revenue", f"${current_transient:,.0f}"],
+            ["Annual group revenue", f"${current_group:,.0f}"],
+        ]),
+        (f"Soft flag breakeven ({soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)", [
+            ["Annualized PIP cost", f"${be['pip_annual']:,.0f}"],
+            ["Transient revenue increase needed", f"${be['delta_t']:,.0f}"],
+            ["% increase over current transient revenue",
+             f"{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else "—"],
+            ["Occupancy-point equivalent", f"≈{occ_pp_equiv:.1f} pp" if occ_pp_equiv is not None else "—"],
+        ]),
+        ("Projected outcome (soft flag base case)", [
+            ["Projected transient revenue", f"${projected_transient:,.0f}"],
+            ["Projected gross revenue", f"${projected_gross:,.0f}"],
+            ["Projected net vs. current", f"${projected_net_vs_current:,.0f}"],
+        ]),
+    ]
+    pdf_bytes = build_summary_pdf(st.session_state["hotel_name"], st.session_state["location"], rooms,
+                                   source_label, pdf_sections, verdict)
+    st.download_button(
+        "Download summary as PDF",
+        data=pdf_bytes,
+        file_name=f"{st.session_state['hotel_name'].replace(' ', '_')}_flag_summary.pdf",
+        mime="application/pdf",
+    )
