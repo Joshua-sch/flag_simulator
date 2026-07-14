@@ -38,20 +38,27 @@ PROPERTY_DEFAULTS = {
 
 FLAG_LABELS = {"hard": "Hard flag (Marriott / Hilton / IHG)", "soft": "Soft brand (Autograph / Tapestry / Vignette)"}
 VARIANT_ORDER = ["pessimistic", "base", "optimistic"]
-VARIANT_LABELS = {"pessimistic": "Pessimistic", "base": "Base", "optimistic": "Optimistic"}
+VARIANT_LABELS = {"pessimistic": "Underperforming", "base": "Base", "optimistic": "Optimistic"}
 
-FLAG_DEFAULTS = {
-    "hard": {
-        "pessimistic": {"fee": 13.0, "occ_lift": 4.0, "trans_lift": 6.0, "adr_impact": -6.0, "pip_per_room": 24000.0},
-        "base":        {"fee": 11.0, "occ_lift": 8.0, "trans_lift": 12.0, "adr_impact": -3.0, "pip_per_room": 18000.0},
-        "optimistic":  {"fee": 9.0, "occ_lift": 14.0, "trans_lift": 18.0, "adr_impact": -1.0, "pip_per_room": 12000.0},
-    },
-    "soft": {
-        "pessimistic": {"fee": 9.0, "occ_lift": 2.0, "trans_lift": 3.0, "adr_impact": 0.0, "pip_per_room": 9500.0},
-        "base":        {"fee": 7.0, "occ_lift": 4.0, "trans_lift": 6.0, "adr_impact": 1.0, "pip_per_room": 7500.0},
-        "optimistic":  {"fee": 5.0, "occ_lift": 6.0, "trans_lift": 9.0, "adr_impact": 3.0, "pip_per_room": 5500.0},
-    },
+# Only the base case is a user-set slider. Optimistic/underperforming are
+# derived automatically (see derive_variant_params) so you tune one set of
+# assumptions per flag type instead of three.
+FLAG_BASE_DEFAULTS = {
+    "hard": {"fee": 11.0, "transient_lift": 12.0, "group_lift": 0.0, "adr_impact": -3.0, "pip_per_room": 18000.0},
+    "soft": {"fee": 7.0, "transient_lift": 6.0, "group_lift": 0.0, "adr_impact": 1.0, "pip_per_room": 7500.0},
 }
+BASE_PARAM_ORDER = ["fee", "transient_lift", "group_lift", "adr_impact", "pip_per_room"]
+
+# Fixed spread applied to the base case to derive optimistic/underperforming.
+# Lift parameters (which can be positive or negative) swing by a percentage
+# of their own magnitude in the favorable/unfavorable direction, so a zero
+# base lift stays zero across all three cases. Fee and PIP cost scale
+# multiplicatively (they're always positive). ADR impact swings by a fixed
+# point spread since it's small and can sit near zero.
+LIFT_SPREAD_PCT = 0.5
+FEE_MULT = {"optimistic": 0.85, "pessimistic": 1.15}
+PIP_MULT = {"optimistic": 0.70, "pessimistic": 1.30}
+ADR_SWING_PP = 2.5
 
 AMORT_YEARS_DEFAULT = 7
 
@@ -62,6 +69,22 @@ SCENARIO_COLORS = {
 }
 
 
+def derive_variant_params(base_params: dict, variant: str) -> dict:
+    """Base case is user-set; optimistic/underperforming are computed from it."""
+    if variant == "base":
+        return dict(base_params)
+    sign = 1.0 if variant == "optimistic" else -1.0
+    fee_mult = FEE_MULT[variant]
+    pip_mult = PIP_MULT[variant]
+    return {
+        "transient_lift": base_params["transient_lift"] + sign * LIFT_SPREAD_PCT * abs(base_params["transient_lift"]),
+        "group_lift": base_params["group_lift"] + sign * LIFT_SPREAD_PCT * abs(base_params["group_lift"]),
+        "fee": base_params["fee"] * fee_mult,
+        "adr_impact": base_params["adr_impact"] + sign * ADR_SWING_PP,
+        "pip_per_room": base_params["pip_per_room"] * pip_mult,
+    }
+
+
 # ===========================================================================
 # Session state — widget keys double as the persistence schema
 # ===========================================================================
@@ -69,19 +92,15 @@ def init_state():
     for k, v in PROPERTY_DEFAULTS.items():
         st.session_state.setdefault(k, v)
     st.session_state.setdefault("amort_years", AMORT_YEARS_DEFAULT)
-    for flag, variants in FLAG_DEFAULTS.items():
-        for variant, params in variants.items():
-            for param, val in params.items():
-                st.session_state.setdefault(f"{flag}_{variant}_{param}", val)
+    for flag, params in FLAG_BASE_DEFAULTS.items():
+        for param, val in params.items():
+            st.session_state.setdefault(f"{flag}_{param}", val)
 
 
 ALL_KEYS = (
     list(PROPERTY_DEFAULTS.keys())
     + ["amort_years"]
-    + [f"{flag}_{variant}_{param}"
-       for flag, variants in FLAG_DEFAULTS.items()
-       for variant, params in variants.items()
-       for param in params]
+    + [f"{flag}_{param}" for flag, params in FLAG_BASE_DEFAULTS.items() for param in params]
 )
 
 init_state()
@@ -90,26 +109,26 @@ init_state()
 # ===========================================================================
 # Core calculation engine
 # ===========================================================================
-def compute_scenario(base_occ, base_adr, base_transient_occ, rooms,
-                      occ_lift_pp, transient_lift_pp, adr_impact_pct,
+def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
+                      transient_lift_pp, group_lift_pp, adr_impact_pct,
                       fee_pct, pip_per_room, amort_years):
     """Returns per-scenario revenue, cost, and index metrics.
 
-    Total occupancy lift drives gross revenue directly. Transient lift is
-    modeled separately and used to split gross revenue into transient vs.
-    group (group = residual), since flag-driven demand concentrates in the
-    loyalty/OTA/GDS-driven transient channel — group business is
-    relationship-driven, not brand-driven, so it's held flat.
+    Transient and group occupancy each get their own lift, since flag-driven
+    demand concentrates in the loyalty/OTA/GDS-driven transient channel while
+    group business is relationship-driven — group lift defaults to 0 (flat)
+    but is independently adjustable. Total occupancy is the sum of the two
+    lifted segments.
     """
-    scenario_occ = max(0.0, min(100.0, base_occ + occ_lift_pp))
     scenario_transient_occ = max(0.0, base_transient_occ + transient_lift_pp)
+    scenario_group_occ = max(0.0, base_group_occ + group_lift_pp)
+    scenario_occ = min(100.0, scenario_transient_occ + scenario_group_occ)
     scenario_adr = max(0.0, base_adr * (1.0 + adr_impact_pct / 100.0))
 
     room_nights = rooms * 365
-    gross_revenue = room_nights * (scenario_occ / 100.0) * scenario_adr
     transient_revenue = room_nights * (scenario_transient_occ / 100.0) * scenario_adr
-    transient_revenue = min(transient_revenue, gross_revenue)
-    group_revenue = gross_revenue - transient_revenue
+    group_revenue = room_nights * (scenario_group_occ / 100.0) * scenario_adr
+    gross_revenue = transient_revenue + group_revenue
 
     fee_cost = gross_revenue * fee_pct / 100.0
     pip_total_cost = pip_per_room * rooms
@@ -146,30 +165,27 @@ def cumulative_benefit(year, annual_incremental_net, pip_total_cost):
 
 def run_all_scenarios():
     rooms = st.session_state["rooms"]
-    base_occ = st.session_state["occ"]
     base_adr = st.session_state["adr"]
     base_transient_occ = st.session_state["transient_occ"]
+    base_group_occ = st.session_state["group_occ"]
     amort_years = st.session_state["amort_years"]
 
-    baseline = compute_scenario(base_occ, base_adr, base_transient_occ, rooms,
-                                 occ_lift_pp=0.0, transient_lift_pp=0.0, adr_impact_pct=0.0,
+    baseline = compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
+                                 transient_lift_pp=0.0, group_lift_pp=0.0, adr_impact_pct=0.0,
                                  fee_pct=0.0, pip_per_room=0.0, amort_years=1.0)
 
     results = {"stay_independent": {**baseline, "label": "Stay independent", "flag": "independent", "variant": "base"}}
 
-    for flag, variants in FLAG_DEFAULTS.items():
+    for flag in FLAG_BASE_DEFAULTS:
+        base_params = {p: st.session_state[f"{flag}_{p}"] for p in BASE_PARAM_ORDER}
         for variant in VARIANT_ORDER:
             key = f"{flag}_{variant}"
-            fee = st.session_state[f"{key}_fee"]
-            occ_lift = st.session_state[f"{key}_occ_lift"]
-            trans_lift = st.session_state[f"{key}_trans_lift"]
-            adr_impact = st.session_state[f"{key}_adr_impact"]
-            pip_per_room = st.session_state[f"{key}_pip_per_room"]
+            params = derive_variant_params(base_params, variant)
 
-            r = compute_scenario(base_occ, base_adr, base_transient_occ, rooms,
-                                  occ_lift_pp=occ_lift, transient_lift_pp=trans_lift,
-                                  adr_impact_pct=adr_impact, fee_pct=fee,
-                                  pip_per_room=pip_per_room, amort_years=amort_years)
+            r = compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
+                                  transient_lift_pp=params["transient_lift"], group_lift_pp=params["group_lift"],
+                                  adr_impact_pct=params["adr_impact"], fee_pct=params["fee"],
+                                  pip_per_room=params["pip_per_room"], amort_years=amort_years)
 
             annual_incremental = (r["gross_revenue"] - r["fee_cost"]) - baseline["net_revenue"]
             pb = payback_years(r["pip_total_cost"], annual_incremental)
@@ -179,6 +195,7 @@ def run_all_scenarios():
                 "label": f"{FLAG_LABELS[flag].split(' (')[0]} — {VARIANT_LABELS[variant]}",
                 "flag": flag,
                 "variant": variant,
+                "params": params,
                 "net_vs_baseline": r["net_revenue"] - baseline["net_revenue"],
                 "annual_incremental": annual_incremental,
                 "payback_years": pb,
@@ -490,25 +507,32 @@ with tab_property:
 # Tab 2 — Flag scenarios
 # ---------------------------------------------------------------------------
 with tab_scenarios:
-    st.markdown("Assumptions for each flag type, split into pessimistic / base / optimistic cases. Adjust to match what you're actually being quoted — PIP cost is the line item that moves this model most.")
+    st.markdown("Set the **base case** assumptions for each flag type — optimistic and underperforming cases are derived automatically from these (wider lift / lower fee & PIP for optimistic, narrower lift / higher fee & PIP for underperforming), so you only tune one set of numbers per flag.")
 
     for flag in ["hard", "soft"]:
         st.markdown(f"#### {FLAG_LABELS[flag]}")
-        cols = st.columns(3)
-        for col, variant in zip(cols, VARIANT_ORDER):
-            with col:
-                st.markdown(f"**{VARIANT_LABELS[variant]}**")
-                key = f"{flag}_{variant}"
-                st.number_input("Franchise + royalty fee (%)", min_value=0.0, max_value=25.0, step=0.5,
-                                 key=f"{key}_fee")
-                st.number_input("Total occupancy lift (pp)", min_value=-10.0, max_value=30.0, step=0.5,
-                                 key=f"{key}_occ_lift")
-                st.number_input("Transient occupancy lift (pp)", min_value=-10.0, max_value=30.0, step=0.5,
-                                 key=f"{key}_trans_lift")
-                st.number_input("ADR impact (%)", min_value=-20.0, max_value=20.0, step=0.5,
-                                 key=f"{key}_adr_impact")
-                st.number_input("PIP cost ($/room)", min_value=0.0, step=500.0,
-                                 key=f"{key}_pip_per_room")
+        c1, c2 = st.columns(2)
+        c1.slider("Franchise + royalty fee (%)", min_value=0.0, max_value=25.0, step=0.5, key=f"{flag}_fee")
+        c2.slider("PIP cost ($/room)", min_value=0.0, max_value=100000.0, step=500.0, key=f"{flag}_pip_per_room")
+        c1.slider("Expected transient occupancy lift (pp)", min_value=-10.0, max_value=30.0, step=0.5,
+                  key=f"{flag}_transient_lift")
+        c2.slider("Expected group occupancy lift (pp)", min_value=-10.0, max_value=30.0, step=0.5,
+                  key=f"{flag}_group_lift")
+        st.slider("ADR impact (%)", min_value=-20.0, max_value=20.0, step=0.5, key=f"{flag}_adr_impact")
+
+        base_params = {p: st.session_state[f"{flag}_{p}"] for p in BASE_PARAM_ORDER}
+        opt = derive_variant_params(base_params, "optimistic")
+        pess = derive_variant_params(base_params, "pessimistic")
+        with st.expander(f"Derived optimistic / underperforming assumptions"):
+            rows = ["Franchise fee", "Transient lift", "Group lift", "ADR impact", "PIP cost/room"]
+
+            def _fmt(p):
+                return [f"{p['fee']:.1f}%", f"{p['transient_lift']:.1f}pp", f"{p['group_lift']:.1f}pp",
+                        f"{p['adr_impact']:.1f}%", f"${p['pip_per_room']:,.0f}"]
+
+            derived_df = pd.DataFrame({"Underperforming": _fmt(pess), "Base": _fmt(base_params), "Optimistic": _fmt(opt)},
+                                       index=rows)
+            st.dataframe(derived_df, use_container_width=True)
         st.divider()
 
 # ---------------------------------------------------------------------------
@@ -641,27 +665,27 @@ with tab_sensitivity:
     sens_variant = c2.selectbox("Hold ADR/PIP at", VARIANT_ORDER, index=1,
                                  format_func=lambda v: VARIANT_LABELS[v], key="sens_variant")
 
-    base_params = FLAG_DEFAULTS[sens_flag][sens_variant]
-    hold_key = f"{sens_flag}_{sens_variant}"
-    adr_impact = st.session_state[f"{hold_key}_adr_impact"]
-    pip_per_room = st.session_state[f"{hold_key}_pip_per_room"]
-    trans_lift_ratio = (st.session_state[f"{hold_key}_trans_lift"] /
-                         st.session_state[f"{hold_key}_occ_lift"]) if st.session_state[f"{hold_key}_occ_lift"] else 1.0
+    base_params = {p: st.session_state[f"{sens_flag}_{p}"] for p in BASE_PARAM_ORDER}
+    held_params = derive_variant_params(base_params, sens_variant)
+    adr_impact = held_params["adr_impact"]
+    pip_per_room = held_params["pip_per_room"]
+    total_lift = held_params["transient_lift"] + held_params["group_lift"]
+    transient_ratio = (held_params["transient_lift"] / total_lift) if total_lift else 0.5
 
     fee_range = np.arange(4.0, 16.5, 0.5)
     lift_range = np.arange(0.0, 22.0, 1.0)
 
     rooms = st.session_state["rooms"]
-    base_occ = st.session_state["occ"]
     base_adr = st.session_state["adr"]
     base_transient_occ = st.session_state["transient_occ"]
+    base_group_occ = st.session_state["group_occ"]
     amort_years = st.session_state["amort_years"]
 
     grid = np.zeros((len(lift_range), len(fee_range)))
     for i, lift in enumerate(lift_range):
         for j, fee in enumerate(fee_range):
-            r = compute_scenario(base_occ, base_adr, base_transient_occ, rooms,
-                                  occ_lift_pp=lift, transient_lift_pp=lift * trans_lift_ratio,
+            r = compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
+                                  transient_lift_pp=lift * transient_ratio, group_lift_pp=lift * (1 - transient_ratio),
                                   adr_impact_pct=adr_impact, fee_pct=fee,
                                   pip_per_room=pip_per_room, amort_years=amort_years)
             grid[i, j] = r["net_revenue"] - baseline["net_revenue"]
