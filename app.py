@@ -467,24 +467,24 @@ with tab_property:
         else:
             st.warning("No recognizable STR fields found. Enter values manually below.")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.text_input("Hotel name", key="hotel_name")
     c2.text_input("Location", key="location")
-    c3.number_input("Room count", min_value=1, step=1, key="rooms")
+    st.slider("Room count", min_value=1, max_value=3000, step=1, key="rooms")
 
     st.markdown("**Current performance**")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.number_input("Occupancy (%)", min_value=0.0, max_value=100.0, step=0.1, key="occ")
-    c2.number_input("ADR ($)", min_value=0.0, step=1.0, key="adr")
-    c3.number_input("Transient occ. (%)", min_value=0.0, max_value=100.0, step=0.1, key="transient_occ")
-    c4.number_input("Group occ. (%)", min_value=0.0, max_value=100.0, step=0.1, key="group_occ")
+    c1, c2 = st.columns(2)
+    c1.slider("Occupancy (%)", min_value=0.0, max_value=100.0, step=0.1, key="occ")
+    c2.slider("ADR ($)", min_value=0.0, max_value=900.0, step=1.0, key="adr")
+    c1.slider("Transient occ. (%)", min_value=0.0, max_value=100.0, step=0.1, key="transient_occ")
+    c2.slider("Group occ. (%)", min_value=0.0, max_value=100.0, step=0.1, key="group_occ")
 
     st.markdown("**Comp set**")
     c1, c2 = st.columns(2)
-    c1.number_input("Comp set occupancy (%)", min_value=0.0, max_value=100.0, step=0.1, key="comp_occ")
-    c2.number_input("Comp set ADR ($)", min_value=0.0, step=1.0, key="comp_adr")
+    c1.slider("Comp set occupancy (%)", min_value=0.0, max_value=100.0, step=0.1, key="comp_occ")
+    c2.slider("Comp set ADR ($)", min_value=0.0, max_value=900.0, step=1.0, key="comp_adr")
 
-    st.number_input("Amortize PIP over (years)", min_value=1, max_value=20, step=1, key="amort_years")
+    st.slider("Amortize PIP over (years)", min_value=1, max_value=20, step=1, key="amort_years")
 
 # ---------------------------------------------------------------------------
 # Tab 2 — Flag scenarios
