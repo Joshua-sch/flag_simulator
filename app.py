@@ -12,6 +12,7 @@ so the output shows a range of outcomes rather than a single point estimate.
 
 import io
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -496,6 +497,117 @@ def parse_rob_workbook(file_bytes: bytes) -> dict:
 
 
 # ===========================================================================
+# BOB (Business on the Books By Date Range) report parser
+#
+# BOB exports are a single flat CSV: a two-row header (a group-label row
+# followed by a sub-column-label row) over daily rows, interspersed with
+# per-month subtotal rows and a final grand-total ("TOTALS") row. Column
+# order/labels are re-detected from the two header rows on every parse
+# rather than assumed by position, since export layouts can add, drop, or
+# reorder columns. Segment occupancy splits are derived from the room-count
+# mix (group / individual room-nights as a share of total room-nights sold)
+# rather than a separately-tracked room inventory, since those room-night
+# counts sum exactly to total rooms sold in these exports.
+# ===========================================================================
+def _bob_header_columns(row0, row1) -> dict:
+    """Maps (group_label, sub_label) -> column index. group_label is None
+    for single (non-grouped) columns like Date/RMS/OCC%."""
+    n = len(row0)
+    group_starts = [i for i, v in enumerate(row0) if isinstance(v, str) and v.strip()]
+    cols = {}
+    for gi, start in enumerate(group_starts):
+        end = group_starts[gi + 1] if gi + 1 < len(group_starts) else n
+        glabel = row0[start].strip().lower()
+        if end - start == 1:
+            cols[(None, glabel)] = start
+        else:
+            for c in range(start, end):
+                sub = row1[c] if c < len(row1) else None
+                if isinstance(sub, str) and sub.strip():
+                    cols[(glabel, sub.strip().lower())] = c
+    return cols
+
+
+def _bob_find(cols, group_substr, sub_substr=None):
+    for (glabel, sublabel), idx in cols.items():
+        if group_substr is None:
+            if glabel is None and sub_substr in sublabel:
+                return idx
+        elif glabel is not None and group_substr in glabel:
+            if sub_substr is None or sub_substr in sublabel:
+                return idx
+    return None
+
+
+def parse_bob_report(file_bytes: bytes) -> dict:
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=object)
+    except Exception as e:
+        return {"_error": str(e)}
+    arr = df.to_numpy()
+    if arr.shape[0] < 3:
+        return {}
+
+    cols = _bob_header_columns(arr[0], arr[1])
+    total_col = _bob_find(cols, "total", "rvn")
+    occ_col = _bob_find(cols, None, "occ")
+    rms_col = _bob_find(cols, None, "rms")
+    group_rvn_col = _bob_find(cols, "group", "rvn")
+    group_picked_col = _bob_find(cols, "group", "picked up")
+    indiv_rvn_col = _bob_find(cols, "individual", "rvn")
+    indiv_count_col = _bob_find(cols, "individual", "count")
+    if None in (total_col, occ_col, rms_col, group_rvn_col, group_picked_col, indiv_rvn_col, indiv_count_col):
+        return {}
+
+    totals_row = next(
+        (arr[r] for r in range(arr.shape[0])
+         if isinstance(arr[r][0], str) and arr[r][0].strip().upper() == "TOTALS"),
+        None,
+    )
+    if totals_row is None:
+        return {}
+
+    def num(row, idx):
+        try:
+            return float(row[idx]) if idx < len(row) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    total_revenue = num(totals_row, total_col)
+    occ_pct = num(totals_row, occ_col)
+    total_rooms_sold = num(totals_row, rms_col)
+    group_revenue = num(totals_row, group_rvn_col)
+    group_rooms = num(totals_row, group_picked_col)
+    transient_revenue = num(totals_row, indiv_rvn_col)
+    transient_rooms = num(totals_row, indiv_count_col)
+
+    out = {
+        "occ": occ_pct,
+        "rob_total_revenue": total_revenue,
+        "rob_group_revenue": group_revenue,
+        "rob_transient_revenue": transient_revenue,
+        "rob_room_nights": total_rooms_sold,
+        "rob_source_sheet": "BOB report",
+    }
+    if total_rooms_sold:
+        out["adr"] = total_revenue / total_rooms_sold
+        out["group_occ"] = occ_pct * (group_rooms / total_rooms_sold)
+        out["transient_occ"] = occ_pct * (transient_rooms / total_rooms_sold)
+
+    years = sorted({
+        int(m.group(1))
+        for r in range(arr.shape[0])
+        if isinstance(arr[r][0], str)
+        for m in [re.match(r"^[A-Za-z]{3}\s+(\d{4})$", arr[r][0].strip())]
+        if m
+    })
+    if years:
+        out["rob_year"] = years[0] if len(years) == 1 else f"{years[0]}–{years[-1]}"
+
+    return out
+
+
+# ===========================================================================
 # Soft-flag breakeven calculation
 #
 # Holding group revenue and ADR flat, how much would transient revenue need
@@ -636,6 +748,25 @@ with tab_property:
                        f"${rob_found.get('rob_total_revenue', 0):,.0f} total revenue.")
         else:
             st.warning("Couldn't find a recognizable TOTAL revenue section in that file.")
+
+    st.markdown("**Actuals from BOB (Business on the Books) — optional, full-year totals**")
+    uploaded_bob = st.file_uploader("Upload BOB report (.csv)", type=["csv"], key="bob_uploader")
+    if uploaded_bob is not None:
+        bob_found = parse_bob_report(uploaded_bob.read())
+        if "_error" in bob_found:
+            st.error(f"Couldn't read that file: {bob_found['_error']}")
+        elif bob_found:
+            for f in ["occ", "adr", "transient_occ", "group_occ"]:
+                if f in bob_found:
+                    st.session_state[f] = bob_found[f]
+            for k in ROB_KEYS:
+                if k in bob_found:
+                    st.session_state[k] = bob_found[k]
+            st.success(f"Pulled {bob_found.get('rob_year', '')} totals from {uploaded_bob.name} — "
+                       f"${bob_found.get('rob_total_revenue', 0):,.0f} total revenue, "
+                       f"{bob_found.get('occ', 0):.1f}% occupancy.")
+        else:
+            st.warning("Couldn't find a recognizable TOTALS row in that BOB file.")
 
     c1, c2 = st.columns(2)
     c1.text_input("Hotel name", key="hotel_name")
