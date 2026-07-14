@@ -133,6 +133,72 @@ init_state()
 
 
 # ===========================================================================
+# Multi-hotel profiles
+#
+# All widget keys in ALL_KEYS live in flat session_state (single active
+# hotel's data). Switching hotels snapshots the current widget values into
+# hotel_profiles[old_hotel], then loads hotel_profiles[new_hotel] (creating a
+# blank one on first use) back into those same widget keys. Streamlit Cloud
+# session state doesn't survive across separate visits, so the sidebar
+# save/load JSON exports the whole hotel_profiles dict rather than just the
+# active hotel, giving a manual (but full-portfolio) persistence path.
+# ===========================================================================
+def _blank_hotel_profile(name: str) -> dict:
+    profile = {k: 0.0 for k in PERFORMANCE_KEYS + COMP_KEYS}
+    profile["hotel_name"] = name
+    profile["location"] = ""
+    profile["rooms"] = PROPERTY_DEFAULTS["rooms"]
+    profile["amort_years"] = AMORT_YEARS_DEFAULT
+    for flag, params in FLAG_BASE_DEFAULTS.items():
+        for param, val in params.items():
+            profile[f"{flag}_{param}"] = val
+    for k in ROB_KEYS:
+        profile[k] = None
+    return profile
+
+
+def _snapshot_current_profile() -> dict:
+    return {k: st.session_state[k] for k in ALL_KEYS}
+
+
+def _load_profile(profile: dict):
+    for k in ALL_KEYS:
+        st.session_state[k] = profile.get(k, PROPERTY_DEFAULTS.get(k))
+
+
+def _switch_hotel(new_hotel: str):
+    old_hotel = st.session_state["active_hotel"]
+    if old_hotel in st.session_state["hotel_profiles"]:
+        st.session_state["hotel_profiles"][old_hotel] = _snapshot_current_profile()
+    if new_hotel not in st.session_state["hotel_profiles"]:
+        st.session_state["hotel_profiles"][new_hotel] = _blank_hotel_profile(new_hotel)
+    _load_profile(st.session_state["hotel_profiles"][new_hotel])
+    st.session_state["active_hotel"] = new_hotel
+    st.session_state["hotel_selector"] = new_hotel
+
+
+def _on_hotel_selector_change():
+    _switch_hotel(st.session_state["hotel_selector"])
+
+
+def _add_hotel():
+    name = st.session_state.get("new_hotel_input", "").strip()
+    if not name:
+        return
+    if name not in st.session_state["hotel_list"]:
+        st.session_state["hotel_list"].append(name)
+    _switch_hotel(name)
+    st.session_state["new_hotel_input"] = ""
+
+
+st.session_state.setdefault("hotel_list", ["Hotel 1620"])
+st.session_state.setdefault("active_hotel", "Hotel 1620")
+st.session_state.setdefault("hotel_selector", st.session_state["active_hotel"])
+if "hotel_profiles" not in st.session_state:
+    st.session_state["hotel_profiles"] = {"Hotel 1620": _snapshot_current_profile()}
+
+
+# ===========================================================================
 # Core calculation engine
 # ===========================================================================
 def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
@@ -391,6 +457,75 @@ def _parse_segmentation_glance_sheet(rows) -> dict:
     return out
 
 
+def _comp_set_metric_block(rows, header_row_idx):
+    """Within one metric block (Occupancy (%) / ADR / RevPAR) of a STR Tab 4
+    Competitive Set Report, finds the 'Running 12 Month' column group, picks
+    its most recent year sub-column, and reads 'My Property' /
+    'Competitive Set' values from that column."""
+    header_row = rows[header_row_idx]
+    r12_col = next(
+        (i for i, v in enumerate(header_row)
+         if isinstance(v, str) and "running 12 month" in v.strip().lower()),
+        None,
+    )
+    if r12_col is None:
+        return None, None
+
+    year_row = rows[header_row_idx + 1] if header_row_idx + 1 < len(rows) else None
+    if year_row is None:
+        return None, None
+    year_cols = [
+        (i, int(v)) for i, v in enumerate(year_row)
+        if i >= r12_col and isinstance(v, (int, float)) and 2000 <= v <= 2100
+    ]
+    if not year_cols:
+        return None, None
+    latest_col = max(year_cols, key=lambda pair: pair[1])[0]
+
+    my_prop_row = next(
+        (rows[j] for j in range(header_row_idx + 1, min(header_row_idx + 6, len(rows)))
+         if any(isinstance(v, str) and v.strip().lower() == "my property" for v in rows[j])),
+        None,
+    )
+    comp_set_row = next(
+        (rows[j] for j in range(header_row_idx + 1, min(header_row_idx + 6, len(rows)))
+         if any(isinstance(v, str) and v.strip().lower() == "competitive set" for v in rows[j])),
+        None,
+    )
+
+    def val(row):
+        if row is None or latest_col >= len(row) or not isinstance(row[latest_col], (int, float)):
+            return None
+        return float(row[latest_col])
+
+    return val(my_prop_row), val(comp_set_row)
+
+
+def _parse_comp_set_report_sheet(rows) -> dict:
+    """STR 'Tab 4 - Competitive Set Report' tab: separate Occupancy (%) / ADR
+    / RevPAR blocks, each with My Property + Competitive Set rows and a
+    Running 12 Month column group (one sub-column per year — we take the
+    most recent). We only need Occupancy and ADR; RevPAR is derivable."""
+    out = {}
+    for label, my_field, comp_field in [
+        ("occupancy (%)", "occ", "comp_occ"),
+        ("adr", "adr", "comp_adr"),
+    ]:
+        header_idx = next(
+            (i for i, row in enumerate(rows)
+             if any(isinstance(v, str) and v.strip().lower() == label for v in row)),
+            None,
+        )
+        if header_idx is None:
+            continue
+        my_val, comp_val = _comp_set_metric_block(rows, header_idx)
+        if my_val is not None:
+            out[my_field] = my_val
+        if comp_val is not None:
+            out[comp_field] = comp_val
+    return out
+
+
 def parse_str_report(file_bytes: bytes, filename: str) -> dict:
     if filename.lower().endswith(".csv"):
         try:
@@ -415,6 +550,9 @@ def parse_str_report(file_bytes: bytes, filename: str) -> dict:
         elif "glance" in lname:
             rows = list(wb[name].iter_rows(values_only=True))
             partial = _parse_glance_sheet(rows)
+        elif "comp" in lname:
+            rows = list(wb[name].iter_rows(values_only=True))
+            partial = _parse_comp_set_report_sheet(rows)
         else:
             continue
         if partial:
@@ -615,7 +753,7 @@ def parse_bob_report(file_bytes: bytes) -> dict:
         if m
     })
     if years:
-        out["rob_year"] = years[0] if len(years) == 1 else f"{years[0]}–{years[-1]}"
+        out["rob_year"] = years[0] if len(years) == 1 else f"{years[0]}-{years[-1]}"
 
     return out
 
@@ -692,12 +830,28 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.markdown("### Hotel")
+    st.selectbox("Active hotel", options=st.session_state["hotel_list"], key="hotel_selector",
+                 on_change=_on_hotel_selector_change)
+    c1, c2 = st.columns([3, 1])
+    c1.text_input("Add new hotel", key="new_hotel_input", placeholder="e.g. Inn at Middletown",
+                  label_visibility="collapsed")
+    c2.button("Add", on_click=_add_hotel, width="stretch")
+
+    st.divider()
     st.markdown("### Save / load scenario")
-    export_data = {k: st.session_state[k] for k in ALL_KEYS}
+    # Snapshot the live widget values into the active hotel's profile before
+    # exporting, so the download reflects any unsaved edits made this session.
+    st.session_state["hotel_profiles"][st.session_state["active_hotel"]] = _snapshot_current_profile()
+    export_data = {
+        "hotel_list": st.session_state["hotel_list"],
+        "active_hotel": st.session_state["active_hotel"],
+        "hotel_profiles": st.session_state["hotel_profiles"],
+    }
     st.download_button(
-        "Download scenario (.json)",
+        "Download all hotels (.json)",
         data=json.dumps(export_data, indent=2),
-        file_name=f"{st.session_state['hotel_name'].replace(' ', '_')}_scenario.json",
+        file_name="linchris_flag_scenarios.json",
         mime="application/json",
         width="stretch",
     )
@@ -705,14 +859,22 @@ with st.sidebar:
     if uploaded_scenario is not None:
         try:
             loaded = json.loads(uploaded_scenario.read())
-            changed = False
-            for k, v in loaded.items():
-                if k in ALL_KEYS and st.session_state.get(k) != v:
-                    st.session_state[k] = v
-                    changed = True
-            if changed:
+            if "hotel_profiles" in loaded:
+                st.session_state["hotel_list"] = loaded.get("hotel_list", list(loaded["hotel_profiles"].keys()))
+                st.session_state["hotel_profiles"] = loaded["hotel_profiles"]
+                _switch_hotel(loaded.get("active_hotel", st.session_state["hotel_list"][0]))
                 st.success("Scenario loaded.")
                 st.rerun()
+            else:
+                # Legacy single-hotel export — apply to the current active hotel.
+                changed = False
+                for k, v in loaded.items():
+                    if k in ALL_KEYS and st.session_state.get(k) != v:
+                        st.session_state[k] = v
+                        changed = True
+                if changed:
+                    st.success("Scenario loaded.")
+                    st.rerun()
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
 
