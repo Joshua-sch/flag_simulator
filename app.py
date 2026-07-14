@@ -1207,6 +1207,10 @@ with tab_summary:
     soft_pip = st.session_state["soft_pip_per_room"]
     be = compute_breakeven(current_gross, current_transient, soft_fee, soft_pip, rooms, amort_years)
     occ_pp_equiv = be["delta_t"] / (room_nights * st.session_state["adr"]) * 100.0 if st.session_state["adr"] > 0 else None
+    current_transient_occ = st.session_state["transient_occ"]
+    target_transient_occ = (current_transient_occ + occ_pp_equiv) if occ_pp_equiv is not None else None
+    occ_pct_increase = (occ_pp_equiv / current_transient_occ * 100.0) if (
+        occ_pp_equiv is not None and current_transient_occ > 0) else None
 
     soft_base = results["soft_base"]
     baseline_r = results["stay_independent"]
@@ -1250,11 +1254,21 @@ with tab_summary:
     c1.metric("Annualized PIP cost", f"${be['pip_annual']:,.0f}")
     c2.metric("Transient revenue increase needed", f"${be['delta_t']:,.0f}",
               f"+{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else None)
-    c3.metric("Occupancy-point equivalent", f"≈{occ_pp_equiv:.1f} pp" if occ_pp_equiv is not None else "—")
+    if target_transient_occ is not None:
+        occ_delta = f"+{occ_pp_equiv:.1f}pp" + (f" ({occ_pct_increase:.1f}%)" if occ_pct_increase is not None else "")
+        c3.metric("Transient occupancy needed", f"{target_transient_occ:.1f}%", occ_delta)
+        relative_clause = f", a {occ_pct_increase:.1f}% relative increase" if occ_pct_increase is not None else ""
+        st.caption(f"Current transient occupancy is {current_transient_occ:.1f}% — breakeven needs it to reach "
+                   f"{target_transient_occ:.1f}% (+{occ_pp_equiv:.1f} percentage points{relative_clause}).")
+    else:
+        c3.metric("Transient occupancy needed", "—")
 
     st.markdown("#### Projected outcome (soft flag base case)")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Projected transient revenue", f"${projected_transient:,.0f}", f"+${projected_delta_t:,.0f}")
+    projected_transient_pct = (projected_delta_t / current_transient * 100.0) if current_transient > 0 else None
+    projected_delta_label = f"+${projected_delta_t:,.0f}" + (
+        f" ({projected_transient_pct:.1f}%)" if projected_transient_pct is not None else "")
+    c1.metric("Projected transient revenue", f"${projected_transient:,.0f}", projected_delta_label)
     c2.metric("Projected gross revenue", f"${projected_gross:,.0f}")
     c3.metric("Projected net vs. current", f"${projected_net_vs_current:,.0f}")
 
@@ -1269,10 +1283,16 @@ with tab_summary:
             ["Transient revenue increase needed", f"${be['delta_t']:,.0f}"],
             ["% increase over current transient revenue",
              f"{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else "—"],
-            ["Occupancy-point equivalent", f"≈{occ_pp_equiv:.1f} pp" if occ_pp_equiv is not None else "—"],
+            ["Current transient occupancy", f"{current_transient_occ:.1f}%"],
+            ["Transient occupancy needed", f"{target_transient_occ:.1f}%" if target_transient_occ is not None else "—"],
+            ["Occupancy increase needed", (
+                f"+{occ_pp_equiv:.1f}pp" + (f" ({occ_pct_increase:.1f}%)" if occ_pct_increase is not None else "")
+            ) if occ_pp_equiv is not None else "—"],
         ]),
         ("Projected outcome (soft flag base case)", [
             ["Projected transient revenue", f"${projected_transient:,.0f}"],
+            ["Projected transient revenue increase", f"+${projected_delta_t:,.0f}" + (
+                f" ({projected_transient_pct:.1f}%)" if projected_transient_pct is not None else "")],
             ["Projected gross revenue", f"${projected_gross:,.0f}"],
             ["Projected net vs. current", f"${projected_net_vs_current:,.0f}"],
         ]),
