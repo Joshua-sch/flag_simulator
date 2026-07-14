@@ -840,7 +840,7 @@ def chart_to_png_bytes(chart, scale=2.0):
         return None
 
 
-def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdict,
+def build_summary_pdf(hotel_name, location, rooms, sections, verdict,
                        scenario_table_rows=None, charts=None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
@@ -849,7 +849,6 @@ def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdi
     elements = [
         Paragraph("Flag Feasibility Summary", styles["Title"]),
         Paragraph(f"{hotel_name} — {location} ({rooms} rooms)", styles["Normal"]),
-        Paragraph(f"Revenue source: {source_label}", styles["Normal"]),
         Spacer(1, 16),
     ]
     for title, rows in sections:
@@ -1340,7 +1339,7 @@ with tab_summary:
         ("Cumulative net benefit over 15 years vs. staying independent", chart_to_png_bytes(payback_chart)),
     ]
     pdf_bytes = build_summary_pdf(st.session_state["hotel_name"], st.session_state["location"], rooms,
-                                   source_label, pdf_sections, verdict,
+                                   pdf_sections, verdict,
                                    scenario_table_rows=rows, charts=results_charts)
     st.download_button(
         "Download summary as PDF",
