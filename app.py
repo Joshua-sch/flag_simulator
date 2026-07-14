@@ -1231,7 +1231,7 @@ with tab_summary:
             current_transient = room_nights * (st.session_state["transient_occ"] / 100.0) * st.session_state["adr"]
             current_group = current_gross - current_transient
     else:
-        source_label = "STR-derived (current month occupancy × ADR, annualized — upload a ROB workbook in tab 1 for full-year actuals)"
+        source_label = "Derived from current occupancy × ADR, annualized"
         current_gross = room_nights * (st.session_state["occ"] / 100.0) * st.session_state["adr"]
         current_transient = room_nights * (st.session_state["transient_occ"] / 100.0) * st.session_state["adr"]
         current_group = current_gross - current_transient
