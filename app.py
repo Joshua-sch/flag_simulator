@@ -1244,10 +1244,11 @@ with tab_summary:
     )
 
     st.markdown("#### Current performance (actuals)")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Annual gross revenue", f"${current_gross:,.0f}")
     c2.metric("Annual transient revenue", f"${current_transient:,.0f}")
     c3.metric("Annual group revenue", f"${current_group:,.0f}")
+    c4.metric("Current transient occupancy", f"{current_transient_occ:.1f}%")
 
     st.markdown(f"#### Soft flag breakeven (at {soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)")
     c1, c2, c3 = st.columns(3)
@@ -1277,6 +1278,7 @@ with tab_summary:
             ["Annual gross revenue", f"${current_gross:,.0f}"],
             ["Annual transient revenue", f"${current_transient:,.0f}"],
             ["Annual group revenue", f"${current_group:,.0f}"],
+            ["Current transient occupancy", f"{current_transient_occ:.1f}%"],
         ]),
         (f"Soft flag breakeven ({soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)", [
             ["Annualized PIP cost", f"${be['pip_annual']:,.0f}"],
