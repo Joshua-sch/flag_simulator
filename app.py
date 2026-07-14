@@ -19,11 +19,12 @@ import pandas as pd
 import openpyxl
 import altair as alt
 import streamlit as st
+import vl_convert as vlc
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="Flag Feasibility Simulator", layout="wide")
 
@@ -829,7 +830,18 @@ def compute_breakeven(current_gross_revenue, current_transient_revenue, fee_pct,
     }
 
 
-def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdict) -> bytes:
+def chart_to_png_bytes(chart, scale=2.0):
+    """Renders an Altair chart to PNG via vl-convert (pure Rust, no browser/
+    Node dependency). Returns None on failure so a rendering hiccup can't
+    take down the whole PDF export."""
+    try:
+        return vlc.vegalite_to_png(chart.to_dict(), scale=scale)
+    except Exception:
+        return None
+
+
+def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdict,
+                       scenario_table_rows=None, charts=None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
                              leftMargin=0.7 * inch, rightMargin=0.7 * inch)
@@ -854,6 +866,47 @@ def build_summary_pdf(hotel_name, location, rooms, source_label, sections, verdi
         elements.append(table)
         elements.append(Spacer(1, 14))
     elements.append(Paragraph(verdict, styles["Normal"]))
+
+    if scenario_table_rows:
+        elements.append(PageBreak())
+        elements.append(Paragraph("Results — scenario comparison", styles["Heading2"]))
+        elements.append(Spacer(1, 8))
+        header = list(scenario_table_rows[0].keys())
+        data = [header] + [[str(v) for v in row.values()] for row in scenario_table_rows]
+        usable_width = letter[0] - 1.4 * inch
+        scenario_col_width = 1.5 * inch
+        other_col_width = (usable_width - scenario_col_width) / (len(header) - 1)
+        col_widths = [scenario_col_width] + [other_col_width] * (len(header) - 1)
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 6.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1C2D4E")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ]))
+        elements.append(table)
+
+    if charts:
+        for title, png_bytes in charts:
+            if png_bytes is None:
+                continue
+            elements.append(PageBreak())
+            elements.append(Paragraph(title, styles["Heading2"]))
+            elements.append(Spacer(1, 8))
+            usable_width = letter[0] - 1.4 * inch
+            usable_height = letter[1] - 2.2 * inch  # leaves room for margins + heading
+            img = Image(io.BytesIO(png_bytes))
+            aspect = img.imageHeight / img.imageWidth
+            width, height = usable_width, usable_width * aspect
+            if height > usable_height:
+                width, height = usable_height / aspect, usable_height
+            img.drawWidth = width
+            img.drawHeight = height
+            elements.append(img)
+
     doc.build(elements)
     buf.seek(0)
     return buf.getvalue()
@@ -1121,8 +1174,8 @@ with tab_results:
         rule = alt.Chart(pd.DataFrame({"y": [baseline["net_revenue"]]})).mark_rule(
             color="#C9A84C", strokeDash=[5, 4], size=2
         ).encode(y="y:Q")
-        st.altair_chart((bars + rule).properties(height=420, title="Annual net revenue by scenario"),
-                         width="stretch")
+        net_revenue_chart = (bars + rule).properties(height=420, title="Annual net revenue by scenario")
+        st.altair_chart(net_revenue_chart, width="stretch")
 
     with col2:
         df_stack = pd.DataFrame({
@@ -1139,8 +1192,8 @@ with tab_results:
             order=alt.Order("Segment:N"),
             tooltip=["Scenario", "Segment", alt.Tooltip("Revenue:Q", format="$,.0f")],
         )
-        st.altair_chart(stacked.properties(height=420, title="Transient vs. group revenue by scenario"),
-                         width="stretch")
+        segment_chart = stacked.properties(height=420, title="Transient vs. group revenue by scenario")
+        st.altair_chart(segment_chart, width="stretch")
 
     # Payback curve
     years = np.arange(0, 16)
@@ -1166,9 +1219,9 @@ with tab_results:
         tooltip=["Scenario", "Year", alt.Tooltip("Cumulative net benefit:Q", format="$,.0f")],
     )
     zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#B9C2D4", size=1.5).encode(y="y:Q")
-    st.altair_chart((line + zero_rule).properties(
-        height=460, title="Cumulative net benefit over 15 years vs. staying independent"),
-        width="stretch")
+    payback_chart = (line + zero_rule).properties(
+        height=460, title="Cumulative net benefit over 15 years vs. staying independent")
+    st.altair_chart(payback_chart, width="stretch")
 
     st.caption("Flag-driven occupancy lift is applied to total occupancy for revenue, and separately to the transient segment for the transient/group split — group business is relationship-driven, not brand-driven, so it's held flat. PIP cost is amortized straight-line over the years set in tab 1.")
 
@@ -1348,8 +1401,14 @@ with tab_summary:
             ["Projected net vs. current", f"${projected_net_vs_current:,.0f}"],
         ]),
     ]
+    results_charts = [
+        ("Annual net revenue by scenario", chart_to_png_bytes(net_revenue_chart)),
+        ("Transient vs. group revenue by scenario", chart_to_png_bytes(segment_chart)),
+        ("Cumulative net benefit over 15 years vs. staying independent", chart_to_png_bytes(payback_chart)),
+    ]
     pdf_bytes = build_summary_pdf(st.session_state["hotel_name"], st.session_state["location"], rooms,
-                                   source_label, pdf_sections, verdict)
+                                   source_label, pdf_sections, verdict,
+                                   scenario_table_rows=rows, charts=results_charts)
     st.download_button(
         "Download summary as PDF",
         data=pdf_bytes,
