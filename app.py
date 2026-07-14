@@ -988,31 +988,6 @@ tab_property, tab_scenarios, tab_results, tab_sensitivity, tab_summary = st.tabs
 # Tab 1 — Property & comp set
 # ---------------------------------------------------------------------------
 with tab_property:
-    st.markdown("Upload an STR report to auto-fill what we can find, or edit the fields directly below. Every field stays editable — STR layouts vary property to property.")
-
-    uploaded_str = st.file_uploader("Upload STR report (.xlsx / .csv)", type=["xlsx", "xls", "csv"], key="str_uploader")
-    if uploaded_str is not None:
-        found = parse_str_report(uploaded_str.read(), uploaded_str.name)
-        if "_error" in found:
-            st.error(f"Couldn't read that file: {found['_error']}")
-        else:
-            _reset_keys(PERFORMANCE_KEYS + COMP_KEYS)
-            field_map = {"occ": "occ", "adr": "adr", "transient_occ": "transient_occ",
-                         "group_occ": "group_occ", "comp_occ": "comp_occ", "comp_adr": "comp_adr",
-                         "rooms": "rooms"}
-            matched = 0
-            for f, key in field_map.items():
-                if f in found:
-                    st.session_state[key] = int(found[f]) if key == "rooms" else found[f]
-                    matched += 1
-            if matched:
-                st.success(f"Cleared previous property metrics and auto-filled {matched} field(s) from "
-                           f"{uploaded_str.name} — fields not found in this file were reset to 0; please "
-                           f"verify against the source.")
-            else:
-                st.warning(f"Couldn't auto-detect fields in {uploaded_str.name}. Previous property metrics "
-                           f"were cleared — enter values manually below.")
-
     st.markdown("**Actuals from ROB (optional — powers the Summary tab)**")
     uploaded_rob = st.file_uploader("Upload ROB Master Workbook (.xlsx)", type=["xlsx", "xls"], key="rob_uploader")
     if uploaded_rob is not None:
