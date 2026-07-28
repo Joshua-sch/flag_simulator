@@ -65,6 +65,16 @@ HOTEL_PRESETS = {
 }
 PROPERTY_DEFAULTS = HOTEL_PRESETS["Hotel 1620"]
 
+# Per-hotel override for occ_decline_damping_pct (see OCC_DECLINE_DAMPING_DEFAULT
+# below) — kept separate from HOTEL_PRESETS since PROPERTY_DEFAULTS is a direct
+# reference to HOTEL_PRESETS["Hotel 1620"] and doubles as the generic fallback
+# for every hotel; baking a 1620-specific value in there would leak into that
+# fallback. 1620 carries a heavy group base, which is relationship-driven and
+# not expected to erode the way transient demand did during the 3 historical
+# conversions — halve any modeled occupancy *decline* (Year 1 jump or ongoing
+# trend) for this property specifically.
+OCC_DECLINE_DAMPING_OVERRIDES = {"Hotel 1620": 50.0}
+
 FLAG_LABELS = {"hard": "Hard flag (Marriott / Hilton / IHG)", "soft": "Soft brand (Autograph / Tapestry / Vignette)"}
 VARIANT_ORDER = ["pessimistic", "base", "optimistic"]
 VARIANT_LABELS = {"pessimistic": "Underperforming", "base": "Base", "optimistic": "Optimistic"}
@@ -84,9 +94,9 @@ FLAG_BASE_DEFAULTS = {
 }
 FLAG_CURVE_SCALE = {"hard": 1.0, "soft": 0.9}
 
-AMORT_YEARS_DEFAULT = 7
 EXIT_OPEX_PCT_DEFAULT = 65.0
 EXIT_CAP_RATE_DEFAULT = 8.0
+OCC_DECLINE_DAMPING_DEFAULT = 100.0
 
 SCENARIO_COLORS = {
     "stay_independent": "#898781",
@@ -118,9 +128,15 @@ def _reset_keys(keys, value=0.0):
 def init_state():
     for k, v in PROPERTY_DEFAULTS.items():
         st.session_state.setdefault(k, v)
-    st.session_state.setdefault("amort_years", AMORT_YEARS_DEFAULT)
     st.session_state.setdefault("exit_opex_pct", EXIT_OPEX_PCT_DEFAULT)
     st.session_state.setdefault("exit_cap_rate", EXIT_CAP_RATE_DEFAULT)
+    # init_state() bootstraps session_state directly from PROPERTY_DEFAULTS
+    # (= HOTEL_PRESETS["Hotel 1620"]) before the multi-hotel machinery below
+    # exists, so it implicitly represents "Hotel 1620" — apply that hotel's
+    # override here too, or the default active hotel would silently start
+    # undamped until you switched away and back.
+    st.session_state.setdefault(
+        "occ_decline_damping_pct", OCC_DECLINE_DAMPING_OVERRIDES.get("Hotel 1620", OCC_DECLINE_DAMPING_DEFAULT))
     for flag, params in FLAG_BASE_DEFAULTS.items():
         for param, val in params.items():
             st.session_state.setdefault(f"{flag}_{param}", val)
@@ -130,7 +146,7 @@ def init_state():
 
 ALL_KEYS = (
     list(PROPERTY_DEFAULTS.keys())
-    + ["amort_years", "exit_opex_pct", "exit_cap_rate"]
+    + ["exit_opex_pct", "exit_cap_rate", "occ_decline_damping_pct"]
     + [f"{flag}_{param}" for flag, params in FLAG_BASE_DEFAULTS.items() for param in params]
     + ROB_KEYS
 )
@@ -154,9 +170,9 @@ def _blank_hotel_profile(name: str) -> dict:
     profile["hotel_name"] = name
     profile["location"] = ""
     profile["rooms"] = PROPERTY_DEFAULTS["rooms"]
-    profile["amort_years"] = AMORT_YEARS_DEFAULT
     profile["exit_opex_pct"] = EXIT_OPEX_PCT_DEFAULT
     profile["exit_cap_rate"] = EXIT_CAP_RATE_DEFAULT
+    profile["occ_decline_damping_pct"] = OCC_DECLINE_DAMPING_DEFAULT
     for flag, params in FLAG_BASE_DEFAULTS.items():
         for param, val in params.items():
             profile[f"{flag}_{param}"] = val
@@ -171,6 +187,8 @@ def _preset_or_blank_profile(name: str) -> dict:
     profile = _blank_hotel_profile(name)
     if name in HOTEL_PRESETS:
         profile.update(HOTEL_PRESETS[name])
+    if name in OCC_DECLINE_DAMPING_OVERRIDES:
+        profile["occ_decline_damping_pct"] = OCC_DECLINE_DAMPING_OVERRIDES[name]
     return profile
 
 
@@ -224,7 +242,7 @@ if "hotel_profiles" not in st.session_state:
 # ===========================================================================
 def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
                       transient_lift_pp, group_lift_pp, adr_impact_pct,
-                      fee_pct, pip_per_room, amort_years):
+                      fee_pct, pip_per_room):
     """Returns per-scenario revenue, cost, and index metrics.
 
     Transient and group occupancy each get their own lift, since flag-driven
@@ -232,6 +250,15 @@ def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
     group business is relationship-driven — group lift defaults to 0 (flat)
     but is independently adjustable. Total occupancy is the sum of the two
     lifted segments.
+
+    PIP is not subtracted from net revenue: it's funded upfront out of the
+    acquisition's cash reserves (part of the down payment, not the operating
+    budget), carries no separate interest charge, and is largely spent down
+    within the first year or so of ownership — it isn't an ongoing operating
+    cost the property has to earn back out of yearly cash flow. pip_total_cost
+    is still returned for informational purposes and for the payback view
+    (Tab 3), which compares it against incremental revenue as a one-time
+    investment rather than an annual charge.
     """
     scenario_transient_occ = max(0.0, base_transient_occ + transient_lift_pp)
     scenario_group_occ = max(0.0, base_group_occ + group_lift_pp)
@@ -245,8 +272,7 @@ def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
 
     fee_cost = gross_revenue * fee_pct / 100.0
     pip_total_cost = pip_per_room * rooms
-    pip_annual_cost = pip_total_cost / amort_years if amort_years > 0 else 0.0
-    net_revenue = gross_revenue - fee_cost - pip_annual_cost
+    net_revenue = gross_revenue - fee_cost
     revpar = (scenario_occ / 100.0) * scenario_adr
 
     return {
@@ -259,7 +285,6 @@ def compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
         "group_revenue": group_revenue,
         "fee_cost": fee_cost,
         "pip_total_cost": pip_total_cost,
-        "pip_annual_cost": pip_annual_cost,
         "net_revenue": net_revenue,
     }
 
@@ -279,7 +304,12 @@ def cumulative_benefit(year, annual_incremental_net, pip_total_cost):
 # kept for reference/display), and a "years" dict of {calendar_year: {adr,
 # occ, comp_adr, comp_occ}}. 2020 and 2021 are omitted everywhere as
 # COVID-distorted; Ann Arbor's 2019 is omitted as a pre-conversion
-# renovation-disruption year, not a clean pre- or post- year.
+# renovation-disruption year, not a clean pre- or post- year; Rockland's 2018
+# and 2019 are omitted as formula-projected rather than real STR-reported
+# performance (see comment on that entry). A hotel with only one clean
+# post-conversion year (like Rockland) still contributes a Year 1 jump data
+# point even though it can't contribute an ongoing-trend data point — see
+# compute_hard_flag_trend().
 # ===========================================================================
 HISTORICAL_HARD_FLAG_CONVERSIONS = [
     {
@@ -329,6 +359,28 @@ HISTORICAL_HARD_FLAG_CONVERSIONS = [
             2024: {"adr": 167.61, "occ": 0.6770, "comp_adr": 176.77, "comp_occ": 0.5830},
             2025: {"adr": 165.07, "occ": 0.6730, "comp_adr": 175.96, "comp_occ": 0.6020},
             2026: {"adr": 167.72, "occ": 0.6834, "comp_adr": 177.72, "comp_occ": 0.6050},
+        },
+    },
+    {
+        "name": "Rockland", "brand": "DoubleTree by Hilton", "conversion_year": 2016, "baseline_year": 2015,
+        # 2018 and 2019 omitted: the source appraisal's monthly comp-set figures
+        # are real (noisy, market-driven) only through July 2018 — from August
+        # 2018 onward they're a flat assumed +2.5%/mo ADR and +1.0%/mo occupancy
+        # growth rate (identical every month, confirmed by inspecting the raw
+        # file), not real STR-reported performance. 2019's subject figures are
+        # also formula-derived for the same reason (14+ decimal digits of
+        # floating-point noise, vs. clean 2-4 decimal real entries elsewhere).
+        # Sold in 2019, pre-COVID, so this only ever contributes a Year 1 jump
+        # (2015 baseline -> 2017, the last clean post-conversion year) — there's
+        # no second clean adjacent post-conversion year to measure an ongoing
+        # trend from.
+        "years": {
+            2012: {"adr": 108.48, "occ": 0.6840, "comp_adr": 118.25, "comp_occ": 0.5660},
+            2013: {"adr": 107.74, "occ": 0.6809, "comp_adr": 127.87, "comp_occ": 0.6140},
+            2014: {"adr": 116.75, "occ": 0.6636, "comp_adr": 134.93, "comp_occ": 0.6830},
+            2015: {"adr": 122.13, "occ": 0.7040, "comp_adr": 143.56, "comp_occ": 0.7280},
+            2016: {"adr": 132.74, "occ": 0.6519, "comp_adr": 141.71, "comp_occ": 0.7500},
+            2017: {"adr": 139.82, "occ": 0.7350, "comp_adr": 140.77, "comp_occ": 0.7644},
         },
     },
 ]
@@ -407,45 +459,51 @@ def compute_hard_flag_trend() -> dict:
     with no such pre-existing momentum. What actually transfers is "how did
     occupancy/ADR move, net of comp set, while operating under this flag."
 
-    Base = average across all 3 hotels, for both components independently.
-    Optimistic/Pessimistic = the single hotel with the highest/lowest net
-    RevPAR trend (keeping its own ADR/occ pairing intact, rather than mixing
-    the best ADR from one hotel with the best occupancy from another — a
-    combination nobody actually had) — same hotel selection used for both
-    the Year-1 jump and the ongoing trend, so a hotel's whole trajectory
-    stays together."""
+    Base = average across every eligible hotel, for each component
+    independently — a hotel with only one clean post-conversion year (e.g.
+    sold too soon after conversion) contributes to the Year-1 jump average
+    but not the ongoing-trend average, since the latter needs at least 2
+    adjacent clean post-conversion years to measure a year-over-year change
+    at all. Optimistic/Pessimistic = the single hotel (among those with an
+    ongoing trend) with the highest/lowest net RevPAR trend, keeping its own
+    ADR/occ/Year-1 pairing intact rather than mixing the best ADR from one
+    hotel with the best occupancy from another — a combination nobody
+    actually had."""
     per_hotel = []
     for hotel in HISTORICAL_HARD_FLAG_CONVERSIONS:
         years = hotel["years"]
         conv_year = hotel["conversion_year"]
+        if not any(y > conv_year for y in years):
+            continue  # no post-conversion data at all — nothing to contribute
         post_years = sorted(y for y in years if y >= conv_year and y != conv_year and y not in (2020, 2021))
         occ_trend, adr_trend, revpar_trend = _yoy_net_trends(years, post_years)
-        if occ_trend is None:
-            continue
         y1_occ, y1_adr, y1_revpar, y1_year = _year1_net_jump(hotel)
         per_hotel.append({"hotel": hotel["name"], "occ_pp_per_yr": occ_trend,
                            "adr_pct_per_yr": adr_trend, "revpar_pct_per_yr": revpar_trend,
                            "y1_occ_pp": y1_occ, "y1_adr_pct": y1_adr, "y1_revpar_pct": y1_revpar,
                            "y1_year": y1_year})
 
-    best = max(per_hotel, key=lambda p: p["revpar_pct_per_yr"])
-    worst = min(per_hotel, key=lambda p: p["revpar_pct_per_yr"])
+    trend_eligible = [p for p in per_hotel if p["occ_pp_per_yr"] is not None]
+    best = max(trend_eligible, key=lambda p: p["revpar_pct_per_yr"])
+    worst = min(trend_eligible, key=lambda p: p["revpar_pct_per_yr"])
     return {
-        "base_occ_pp_per_yr": sum(p["occ_pp_per_yr"] for p in per_hotel) / len(per_hotel),
-        "base_adr_pct_per_yr": sum(p["adr_pct_per_yr"] for p in per_hotel) / len(per_hotel),
+        "base_occ_pp_per_yr": sum(p["occ_pp_per_yr"] for p in trend_eligible) / len(trend_eligible),
+        "base_adr_pct_per_yr": sum(p["adr_pct_per_yr"] for p in trend_eligible) / len(trend_eligible),
         "optimistic_occ_pp_per_yr": best["occ_pp_per_yr"], "optimistic_adr_pct_per_yr": best["adr_pct_per_yr"],
         "pessimistic_occ_pp_per_yr": worst["occ_pp_per_yr"], "pessimistic_adr_pct_per_yr": worst["adr_pct_per_yr"],
         "base_y1_occ_pp": sum(p["y1_occ_pp"] for p in per_hotel) / len(per_hotel),
         "base_y1_adr_pct": sum(p["y1_adr_pct"] for p in per_hotel) / len(per_hotel),
         "optimistic_y1_occ_pp": best["y1_occ_pp"], "optimistic_y1_adr_pct": best["y1_adr_pct"],
         "pessimistic_y1_occ_pp": worst["y1_occ_pp"], "pessimistic_y1_adr_pct": worst["y1_adr_pct"],
-        "n": len(per_hotel),
+        "n": len(trend_eligible),
+        "n_y1": len(per_hotel),
         "per_hotel": per_hotel,
     }
 
 
 def compute_flag_year_by_year(base_adr, base_transient_occ, base_group_occ, rooms,
-                               fee_pct, pip_per_room, amort_years, variant, trend, scale=1.0, years=15):
+                               fee_pct, pip_per_room, variant, trend, scale=1.0, years=15,
+                               occ_decline_damping=1.0):
     """Year-by-year flag projection in two stages, matching the shape the 3
     real conversions actually show:
 
@@ -463,34 +521,44 @@ def compute_flag_year_by_year(base_adr, base_transient_occ, base_group_occ, room
     which doesn't exist yet — pass 1.0 for Hard, FLAG_CURVE_SCALE["soft"]
     for Soft.
 
+    `occ_decline_damping` (0-1) scales down any *negative* occupancy
+    component only (Year 1 jump and/or ongoing trend) — for a property whose
+    demand mix makes it less exposed to the disruption/reversion the
+    historical conversions show (e.g. a heavy, relationship-driven group
+    base that isn't expected to erode the way transient demand did). Positive
+    occupancy components are left untouched; this only softens declines.
+
+    PIP is not subtracted from net revenue — see compute_scenario for why
+    (funded upfront out of acquisition cash reserves, not an operating cost).
+    pip_total_cost is still returned for the payback view.
+
     No transient/group split: the historical conversions only ever reported
     total occupancy, never a segment breakdown, so allocating the change
     across segments would just be a made-up assumption layered on top of
     real data. Revenue is computed straight from total occupancy x ADR."""
     room_nights = rooms * 365
     pip_total_cost = pip_per_room * rooms
-    pip_annual_cost_active = pip_total_cost / amort_years if amort_years > 0 else 0.0
     base_total_occ = base_transient_occ + base_group_occ
     occ_trend_pp = trend[f"{variant}_occ_pp_per_yr"] * scale
     adr_trend_pct = trend[f"{variant}_adr_pct_per_yr"] * scale
     y1_occ_pp = trend[f"{variant}_y1_occ_pp"] * scale
     y1_adr_pct = trend[f"{variant}_y1_adr_pct"] * scale
+    if occ_trend_pp < 0:
+        occ_trend_pp *= occ_decline_damping
+    if y1_occ_pp < 0:
+        y1_occ_pp *= occ_decline_damping
     year1_occ = base_total_occ + y1_occ_pp
     year1_adr = base_adr * (1.0 + y1_adr_pct / 100.0)
 
     yearly = []
     for year in range(1, years + 1):
-        # Straight-line amortization ends after amort_years — the PIP is paid
-        # off by then, so it shouldn't keep reducing NOI/net revenue in later
-        # years (e.g. a Year 10 snapshot with a 7-year amortization).
-        pip_annual_cost = pip_annual_cost_active if year <= amort_years else 0.0
         years_of_ongoing_drift = year - 1  # Year 1 is the jump itself, no added drift yet
         scenario_occ = max(0.0, min(100.0, year1_occ + occ_trend_pp * years_of_ongoing_drift))
         scenario_adr = max(0.0, year1_adr * (1.0 + adr_trend_pct / 100.0) ** years_of_ongoing_drift)
 
         gross_revenue = room_nights * (scenario_occ / 100.0) * scenario_adr
         fee_cost = gross_revenue * fee_pct / 100.0
-        net_revenue = gross_revenue - fee_cost - pip_annual_cost
+        net_revenue = gross_revenue - fee_cost
         revpar = (scenario_occ / 100.0) * scenario_adr
 
         yearly.append({
@@ -498,7 +566,7 @@ def compute_flag_year_by_year(base_adr, base_transient_occ, base_group_occ, room
             "occupancy_pct": scenario_occ,
             "adr": scenario_adr, "revpar": revpar,
             "gross_revenue": gross_revenue,
-            "fee_cost": fee_cost, "pip_total_cost": pip_total_cost, "pip_annual_cost": pip_annual_cost,
+            "fee_cost": fee_cost, "pip_total_cost": pip_total_cost,
             "net_revenue": net_revenue,
         })
     return yearly
@@ -538,27 +606,33 @@ def scenario_cumulative_at_year(r, year):
 # ===========================================================================
 # Exit valuation — income-capitalization approach
 #
-# NOI = Gross revenue x (1 - OpEx%) - franchise fee - annualized PIP cost.
-# OpEx% covers rooms/labor/utilities/admin, i.e. everything *except* the
-# franchise fee and PIP amortization the model already tracks separately —
-# those are subtracted on top rather than folded into one all-in ratio.
+# NOI = Gross revenue x (1 - OpEx%) - franchise fee. OpEx% covers rooms/
+# labor/utilities/admin; the franchise fee is subtracted on top since it's a
+# genuine, permanent % of every dollar of revenue for as long as the
+# property carries the flag. PIP is deliberately excluded from NOI — it's
+# funded upfront out of the acquisition's cash reserves (part of the down
+# payment, not the operating budget), carries no separate interest charge,
+# and is largely spent down within the first year or so, so it isn't a
+# recurring operating cost the property has to keep earning back. At sale,
+# any remaining PIP-related loan balance is a below-the-line, ownership-level
+# item (affects equity proceeds), not a property-level valuation input.
 # Value = NOI / Cap Rate, the standard direct-capitalization method.
 # ===========================================================================
-def compute_valuation(gross_revenue, fee_cost, pip_annual_cost, opex_pct, cap_rate):
-    noi = gross_revenue * (1.0 - opex_pct / 100.0) - fee_cost - pip_annual_cost
+def compute_valuation(gross_revenue, fee_cost, opex_pct, cap_rate):
+    noi = gross_revenue * (1.0 - opex_pct / 100.0) - fee_cost
     value = (noi / (cap_rate / 100.0)) if cap_rate > 0 else None
     return noi, value
 
 
 def scenario_yearly_series(r, years=15):
-    """Per-year (gross_revenue, fee_cost, pip_annual_cost) for any scenario
-    row. Flag scenarios already carry a real "yearly" series (occupancy/ADR
-    move year to year); Stay Independent has no growth modeled, so it's
-    treated as flat at its current actuals for every year — a fair,
-    unchanging baseline to compare the growing flag scenarios against."""
+    """Per-year (gross_revenue, fee_cost) for any scenario row. Flag
+    scenarios already carry a real "yearly" series (occupancy/ADR move year
+    to year); Stay Independent has no growth modeled, so it's treated as
+    flat at its current actuals for every year — a fair, unchanging
+    baseline to compare the growing flag scenarios against."""
     if "yearly" in r:
-        return [(y["gross_revenue"], y["fee_cost"], y["pip_annual_cost"]) for y in r["yearly"][:years]]
-    return [(r["gross_revenue"], r["fee_cost"], 0.0)] * years
+        return [(y["gross_revenue"], y["fee_cost"]) for y in r["yearly"][:years]]
+    return [(r["gross_revenue"], r["fee_cost"])] * years
 
 
 def run_all_scenarios():
@@ -566,11 +640,11 @@ def run_all_scenarios():
     base_adr = st.session_state["adr"]
     base_transient_occ = st.session_state["transient_occ"]
     base_group_occ = st.session_state["group_occ"]
-    amort_years = st.session_state["amort_years"]
+    occ_decline_damping = st.session_state["occ_decline_damping_pct"] / 100.0
 
     baseline = compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
                                  transient_lift_pp=0.0, group_lift_pp=0.0, adr_impact_pct=0.0,
-                                 fee_pct=0.0, pip_per_room=0.0, amort_years=1.0)
+                                 fee_pct=0.0, pip_per_room=0.0)
 
     results = {"stay_independent": {**baseline, "label": "Stay independent", "flag": "independent", "variant": "base"}}
 
@@ -589,8 +663,9 @@ def run_all_scenarios():
             key = f"{flag}_{variant}"
             yearly = compute_flag_year_by_year(
                 base_adr, base_transient_occ, base_group_occ, rooms,
-                fee_pct=fee, pip_per_room=pip_per_room, amort_years=amort_years,
+                fee_pct=fee, pip_per_room=pip_per_room,
                 variant=variant, trend=hard_trend, scale=scale, years=15,
+                occ_decline_damping=occ_decline_damping,
             )
             snapshot = yearly[9]  # Year 10
             annual_incrementals = [(y["gross_revenue"] - y["fee_cost"]) - baseline["net_revenue"] for y in yearly]
@@ -1099,13 +1174,14 @@ def parse_bob_report(file_bytes: bytes) -> dict:
 # total occupancy only, since neither flag type has segment-level historical
 # data to draw a transient-specific figure from.
 # ===========================================================================
-def compute_breakeven(current_gross_revenue, fee_pct, pip_per_room, rooms, amort_years):
+def compute_breakeven(current_gross_revenue, fee_pct):
+    """Revenue increase needed to offset the franchise fee alone. PIP isn't
+    part of this bar — it's funded upfront out of acquisition cash reserves,
+    not out of the ongoing revenue this measures (see compute_scenario)."""
     fee = fee_pct / 100.0
-    pip_annual = (pip_per_room * rooms) / amort_years if amort_years > 0 else 0.0
-    delta_revenue = (fee * current_gross_revenue + pip_annual) / (1 - fee) if fee < 1 else float("inf")
+    delta_revenue = (fee * current_gross_revenue) / (1 - fee) if fee < 1 else float("inf")
     pct_increase = (delta_revenue / current_gross_revenue * 100.0) if current_gross_revenue > 0 else None
     return {
-        "pip_annual": pip_annual,
         "delta_revenue": delta_revenue,
         "pct_increase": pct_increase,
         "breakeven_gross_revenue": current_gross_revenue + delta_revenue,
@@ -1286,7 +1362,13 @@ with tab_property:
     c1.slider("Comp set occupancy (%)", min_value=0.0, max_value=100.0, step=0.1, key="comp_occ")
     c2.slider("Comp set ADR ($)", min_value=0.0, max_value=900.0, step=1.0, key="comp_adr")
 
-    st.slider("Amortize PIP over (years)", min_value=1, max_value=20, step=1, key="amort_years")
+    st.slider("Apply this % of any modeled occupancy decline", min_value=0, max_value=100, step=5,
+              key="occ_decline_damping_pct",
+              help="100% = use the historical occupancy decline (Year 1 jump or ongoing trend) as-is. Lower this "
+                   "for a property you believe is less exposed to the disruption/reversion the 3 historical "
+                   "conversions show — e.g. a heavy, relationship-driven group base that isn't expected to erode "
+                   "the way transient demand did. Only applies to negative occupancy components; occupancy gains "
+                   "are never scaled up by this.")
 
 # ---------------------------------------------------------------------------
 # Tab 2 — Flag scenarios
@@ -1298,6 +1380,10 @@ with tab_scenarios:
 
     hard_trend = compute_hard_flag_trend()
     hotel_names = ", ".join(h["name"] for h in HISTORICAL_HARD_FLAG_CONVERSIONS)
+    occ_decline_damping = st.session_state["occ_decline_damping_pct"] / 100.0
+
+    def _damped_occ(pp):
+        return pp * occ_decline_damping if pp < 0 else pp
 
     for flag in ["hard", "soft"]:
         scale = FLAG_CURVE_SCALE[flag]
@@ -1312,6 +1398,10 @@ with tab_scenarios:
         c1, c2 = st.columns(2)
         c1.slider("Franchise + royalty fee (%)", min_value=0.0, max_value=25.0, step=0.5, key=f"{flag}_fee")
         c2.slider("PIP cost ($/room)", min_value=0.0, max_value=100000.0, step=500.0, key=f"{flag}_pip_per_room")
+        st.caption("PIP is treated as a one-time cost funded upfront out of the acquisition's cash reserves "
+                   "(part of the down payment), not an ongoing operating expense — it doesn't reduce net "
+                   "revenue, NOI, or exit value anywhere in this model. It still shows up in the payback view "
+                   "(Tab 3) as the investment amount incremental revenue is measured against.")
 
         trend_title = f"Historical post-conversion trend driving {FLAG_LABELS[flag].split(' (')[0]} (Underperforming / Base / Optimistic)"
         with st.expander(trend_title, expanded=(flag == "hard")):
@@ -1319,37 +1409,53 @@ with tab_scenarios:
                        "post-conversion year. **Year 2+** — ongoing year-over-year drift after that.")
             trend_rows = [{
                 "Case": VARIANT_LABELS[v],
-                "Year 1 occupancy jump": f"{hard_trend[f'{v}_y1_occ_pp'] * scale:+.2f}pp",
+                "Year 1 occupancy jump": f"{_damped_occ(hard_trend[f'{v}_y1_occ_pp'] * scale):+.2f}pp",
                 "Year 1 ADR jump": f"{hard_trend[f'{v}_y1_adr_pct'] * scale:+.2f}%",
-                "Year 2+ occupancy growth": f"{hard_trend[f'{v}_occ_pp_per_yr'] * scale:+.2f}pp/yr",
+                "Year 2+ occupancy growth": f"{_damped_occ(hard_trend[f'{v}_occ_pp_per_yr'] * scale):+.2f}pp/yr",
                 "Year 2+ ADR growth": f"{hard_trend[f'{v}_adr_pct_per_yr'] * scale:+.2f}%/yr",
             } for v in ["pessimistic", "base", "optimistic"]]
             st.dataframe(pd.DataFrame(trend_rows), width="stretch", hide_index=True)
+            if occ_decline_damping < 1.0:
+                st.caption(f"Occupancy decline damping is active for this property (applying "
+                           f"{occ_decline_damping * 100:.0f}% of any modeled decline) — figures above reflect that; "
+                           f"the per-hotel breakdown below does not, since it's the raw historical data.")
 
-            st.caption("Per-hotel breakdown feeding the row above:")
+            st.caption("Per-hotel breakdown feeding the row above (Year 2+ shows \"— sold too soon\" for a hotel "
+                       "with only one clean post-conversion year — it still contributes to the Year 1 average, "
+                       "just not to the ongoing-trend average):")
             per_hotel_rows = [{
                 "Hotel": p["hotel"],
                 "Year 1 occupancy jump": f"{p['y1_occ_pp']:+.2f}pp",
                 "Year 1 ADR jump": f"{p['y1_adr_pct']:+.2f}%",
-                "Year 2+ occupancy growth": f"{p['occ_pp_per_yr']:+.2f}pp/yr",
-                "Year 2+ ADR growth": f"{p['adr_pct_per_yr']:+.2f}%/yr",
+                "Year 2+ occupancy growth": (
+                    f"{p['occ_pp_per_yr']:+.2f}pp/yr" if p["occ_pp_per_yr"] is not None else "— sold too soon"),
+                "Year 2+ ADR growth": (
+                    f"{p['adr_pct_per_yr']:+.2f}%/yr" if p["adr_pct_per_yr"] is not None else "— sold too soon"),
             } for p in hard_trend["per_hotel"]]
             st.dataframe(pd.DataFrame(per_hotel_rows), width="stretch", hide_index=True)
 
             scale_clause = "" if scale == 1.0 else f", scaled to {scale * 100:.0f}% for Soft brand,"
+            n_only_y1 = hard_trend["n_y1"] - hard_trend["n"]
+            trend_count_clause = (
+                f"all {hard_trend['n_y1']} contribute the Year 1 jump; {hard_trend['n']} of them also have a "
+                f"second clean adjacent post-conversion year to measure an ongoing Year 2+ trend from "
+                f"({n_only_y1} hotel{'s' if n_only_y1 != 1 else ''} sold too soon after conversion to measure "
+                f"that)." if n_only_y1 > 0 else f"all {hard_trend['n_y1']} contribute both components."
+            )
             st.caption(
                 f"All figures are net of each hotel's own comp set (isolates the flag's effect from market-wide "
-                f"pricing movement). Derived from {hard_trend['n']} real LinChris hard-flag conversions "
+                f"pricing movement). Derived from {hard_trend['n_y1']} real LinChris hard-flag conversions "
                 f"({hotel_names}){scale_clause}, excluding the conversion year itself (real transition disruption, "
-                f"not steady state) and 2020-2021 (COVID-distorted). All 3 conversions show ADR re-rating fast "
+                f"not steady state), 2020-2021 (COVID-distorted), and any period found to be a formula-projected "
+                f"assumption rather than real reported performance. Most conversions show ADR re-rating fast "
                 f"(most of the gain lands in the conversion year or the year right after) while occupancy "
                 f"typically dips first (PIP construction disruption) before recovering — the Year 1 jump captures "
-                f"that shape, then Year 2+ applies the slower ongoing drift on top. Base is the average across all "
-                f"{hard_trend['n']} hotels; Optimistic/Underperforming use the single best/worst-performing hotel "
-                f"(by net RevPAR trend) for both components, keeping each hotel's own trajectory intact rather "
-                f"than mixing pieces from different hotels. Add more conversions to "
-                f"HISTORICAL_HARD_FLAG_CONVERSIONS in the code as they become available; this recomputes "
-                f"automatically."
+                f"that shape, then Year 2+ applies the slower ongoing drift on top. Base is the average across "
+                f"every eligible hotel per component — {trend_count_clause} Optimistic/Underperforming use the "
+                f"single best/worst-performing hotel (by net RevPAR trend, among those with an ongoing trend) for "
+                f"both components, keeping each hotel's own trajectory intact rather than mixing pieces from "
+                f"different hotels. Add more conversions to HISTORICAL_HARD_FLAG_CONVERSIONS in the code as they "
+                f"become available; this recomputes automatically."
             )
         st.divider()
 
@@ -1368,7 +1474,7 @@ with tab_results:
 
     if best_key == "stay_independent":
         verdict = (f"At these inputs, staying independent nets ${best['net_revenue']:,.0f}/yr — more than any flag "
-                   f"option after fees and PIP costs. No scenario pays for itself unless the lift or fee assumptions change.")
+                   f"option after the franchise fee. No scenario pays for itself unless the lift or fee assumptions change.")
     else:
         verdict = (f"**{best['label']}** nets ${best['net_revenue']:,.0f}/yr, ${best['net_vs_baseline']:,.0f} above "
                    f"staying independent — the strongest option at these inputs.")
@@ -1393,8 +1499,8 @@ with tab_results:
             "ADR": f"${r['adr']:,.0f}",
             "Gross revenue": f"${r['gross_revenue']:,.0f}",
             "Fee cost": f"${r['fee_cost']:,.0f}",
-            "PIP (annualized)": f"${r['pip_annual_cost']:,.0f}",
             "Net revenue": f"${r['net_revenue']:,.0f}",
+            "PIP investment": "—" if k == "stay_independent" else f"${r['pip_total_cost']:,.0f}",
             "Net vs. independent": "—" if k == "stay_independent" else f"${r['net_vs_baseline']:,.0f}",
             "Payback (yrs)": "—" if k == "stay_independent" else (
                 f"{r['payback_years']:.1f}" if r["payback_years"] is not None else "never"),
@@ -1478,7 +1584,10 @@ with tab_results:
         height=460, title="Cumulative net benefit over 15 years vs. staying independent")
     st.altair_chart(payback_chart, width="stretch")
 
-    st.caption("Flag-driven occupancy lift is applied to total occupancy for revenue, and separately to the transient segment for the transient/group split — group business is relationship-driven, not brand-driven, so it's held flat. PIP cost is amortized straight-line over the years set in tab 1.")
+    st.caption("Net revenue is gross revenue minus the franchise fee only — PIP isn't subtracted here, since it's "
+               "funded upfront from acquisition cash reserves rather than paid out of ongoing operations. The "
+               "cumulative net benefit chart above still nets each year's incremental revenue against the total "
+               "PIP investment as a one-time amount, to show when that investment is offset.")
 
 # ---------------------------------------------------------------------------
 # Tab 4 — Sensitivity
@@ -1495,7 +1604,6 @@ with tab_sensitivity:
     base_adr = st.session_state["adr"]
     base_transient_occ = st.session_state["transient_occ"]
     base_group_occ = st.session_state["group_occ"]
-    amort_years = st.session_state["amort_years"]
 
     # Both flags hold ADR impact at the historical trend's Year-10 compounded
     # value for the selected variant (scaled down for Soft, matching the
@@ -1521,7 +1629,7 @@ with tab_sensitivity:
             r = compute_scenario(base_adr, base_transient_occ, base_group_occ, rooms,
                                   transient_lift_pp=lift, group_lift_pp=0.0,
                                   adr_impact_pct=adr_impact, fee_pct=fee,
-                                  pip_per_room=pip_per_room, amort_years=amort_years)
+                                  pip_per_room=pip_per_room)
             grid[i, j] = r["net_revenue"] - baseline["net_revenue"]
 
     vmax = max(abs(grid.min()), abs(grid.max()), 1.0)
@@ -1550,18 +1658,32 @@ with tab_summary:
 
     rooms = st.session_state["rooms"]
     room_nights = rooms * 365
-    amort_years = st.session_state["amort_years"]
 
     current_occ = st.session_state["occ"]
     current_gross = room_nights * (current_occ / 100.0) * st.session_state["adr"]
 
+    current_adr = st.session_state["adr"]
     soft_fee = st.session_state["soft_fee"]
     soft_pip = st.session_state["soft_pip_per_room"]
-    be = compute_breakeven(current_gross, soft_fee, soft_pip, rooms, amort_years)
-    occ_pp_equiv = be["delta_revenue"] / (room_nights * st.session_state["adr"]) * 100.0 if st.session_state["adr"] > 0 else None
+    soft_pip_total = soft_pip * rooms
+    be = compute_breakeven(current_gross, soft_fee)
+
+    # Two alternative single-lever framings of the same breakeven dollar
+    # figure — occupancy held flat and ADR does all the work, or vice versa.
+    # The historical conversion data shows the flag's effect lands almost
+    # entirely on ADR (Year 1 re-rating jump), so the ADR framing is the one
+    # that actually matches what's expected to happen — the occupancy framing
+    # is shown mainly as a reference point, not because occupancy is the
+    # lever this model expects to move.
+    occ_pp_equiv = be["delta_revenue"] / (room_nights * current_adr) * 100.0 if current_adr > 0 else None
     target_occ = (current_occ + occ_pp_equiv) if occ_pp_equiv is not None else None
     occ_pct_increase = (occ_pp_equiv / current_occ * 100.0) if (
         occ_pp_equiv is not None and current_occ > 0) else None
+
+    adr_dollar_equiv = be["delta_revenue"] / (room_nights * current_occ / 100.0) if current_occ > 0 else None
+    target_adr = (current_adr + adr_dollar_equiv) if adr_dollar_equiv is not None else None
+    adr_pct_increase = (adr_dollar_equiv / current_adr * 100.0) if (
+        adr_dollar_equiv is not None and current_adr > 0) else None
 
     soft_base = results["soft_base"]
     baseline_r = results["stay_independent"]
@@ -1571,8 +1693,7 @@ with tab_summary:
 
     soft_params = soft_base["params"]
     projected_fee_cost = projected_gross * soft_params["fee"] / 100.0
-    projected_pip_annual = (soft_params["pip_per_room"] * rooms) / amort_years if amort_years > 0 else 0.0
-    projected_net = projected_gross - projected_fee_cost - projected_pip_annual
+    projected_net = projected_gross - projected_fee_cost
     projected_net_vs_current = projected_net - current_gross
     projected_delta = projected_gross - current_gross
     gap = projected_delta - be["delta_revenue"]
@@ -1595,45 +1716,75 @@ with tab_summary:
     c1.metric("Annual gross revenue", f"${current_gross:,.0f}")
     c2.metric("Current occupancy", f"{current_occ:.1f}%")
 
-    st.markdown(f"#### Soft flag breakeven (at {soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Annualized PIP cost", f"${be['pip_annual']:,.0f}")
+    st.markdown(f"#### Soft flag breakeven (at {soft_fee:.1f}% fee)")
+    c1, c2 = st.columns(2)
+    c1.metric("Total PIP investment", f"${soft_pip_total:,.0f}",
+              help="Funded upfront from acquisition cash reserves, not from ongoing revenue — not part of the "
+                   "breakeven bar below.")
     c2.metric("Revenue increase needed", f"${be['delta_revenue']:,.0f}",
               f"+{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else None)
+
+    st.caption("The two figures below are **alternative** single-lever ways to hit that same revenue increase — "
+               "not additive. **ADR is the one the historical conversion data actually supports**: the flag's "
+               "Year 1 effect lands almost entirely on rate, not occupancy (see Tab 2). The occupancy figure is "
+               "shown for reference, not because occupancy is the lever expected to move.")
+
+    c1, c2 = st.columns(2)
+    if target_adr is not None:
+        adr_delta = f"+${adr_dollar_equiv:,.0f}" + (f" ({adr_pct_increase:.1f}%)" if adr_pct_increase is not None else "")
+        c1.metric("ADR needed (occupancy held flat)", f"${target_adr:,.0f}", adr_delta)
+    else:
+        c1.metric("ADR needed (occupancy held flat)", "—")
     if target_occ is not None:
         occ_delta = f"+{occ_pp_equiv:.1f}pp" + (f" ({occ_pct_increase:.1f}%)" if occ_pct_increase is not None else "")
-        c3.metric("Occupancy needed", f"{target_occ:.1f}%", occ_delta)
-        relative_clause = f", a {occ_pct_increase:.1f}% relative increase" if occ_pct_increase is not None else ""
-        st.caption(f"Current occupancy is {current_occ:.1f}% — breakeven needs it to reach "
-                   f"{target_occ:.1f}% (+{occ_pp_equiv:.1f} percentage points{relative_clause}).")
+        c2.metric("Occupancy needed (ADR held flat)", f"{target_occ:.1f}%", occ_delta)
     else:
-        c3.metric("Occupancy needed", "—")
+        c2.metric("Occupancy needed (ADR held flat)", "—")
+
+    if target_adr is not None:
+        relative_clause = f", a {adr_pct_increase:.1f}% relative increase" if adr_pct_increase is not None else ""
+        st.caption(f"Current ADR is \\${current_adr:,.0f} — breakeven needs it to reach \\${target_adr:,.0f} "
+                   f"(+\\${adr_dollar_equiv:,.0f}{relative_clause}) to offset the franchise fee alone, holding "
+                   f"occupancy at today's {current_occ:.1f}%.")
 
     def _signed_dollars(value):
         sign = "-" if value < 0 else "+"
         return f"{sign}${abs(value):,.0f}"
 
     st.markdown("#### Projected outcome (soft flag base case)")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     projected_pct = (projected_delta / current_gross * 100.0) if current_gross > 0 else None
     projected_delta_label = _signed_dollars(projected_delta) + (
         f" ({projected_pct:+.1f}%)" if projected_pct is not None else "")
     c1.metric("Projected gross revenue", f"${projected_gross:,.0f}", projected_delta_label)
-    c2.metric("Projected occupancy", f"{soft_base['occupancy_pct']:.1f}%")
-    c3.metric("Projected net vs. current", f"${projected_net_vs_current:,.0f}")
+    projected_adr_delta = soft_base["adr"] - current_adr
+    projected_adr_pct = (projected_adr_delta / current_adr * 100.0) if current_adr > 0 else None
+    projected_adr_label = _signed_dollars(projected_adr_delta) + (
+        f" ({projected_adr_pct:+.1f}%)" if projected_adr_pct is not None else "")
+    c2.metric("Projected ADR", f"${soft_base['adr']:,.0f}", projected_adr_label)
+    projected_occ_delta = soft_base["occupancy_pct"] - current_occ
+    c3.metric("Projected occupancy", f"{soft_base['occupancy_pct']:.1f}%", f"{projected_occ_delta:+.1f}pp")
+    c4.metric("Projected net vs. current", f"${projected_net_vs_current:,.0f}")
+    st.caption("ADR carries almost all of the projected gain here — occupancy moves only modestly, consistent "
+               "with the historical conversion data this projection is built from.")
 
     pdf_sections = [
         ("Current performance (actuals)", [
             ["Annual gross revenue", f"${current_gross:,.0f}"],
             ["Current occupancy", f"{current_occ:.1f}%"],
         ]),
-        (f"Soft flag breakeven ({soft_fee:.1f}% fee, ${soft_pip:,.0f}/room PIP)", [
-            ["Annualized PIP cost", f"${be['pip_annual']:,.0f}"],
+        (f"Soft flag breakeven ({soft_fee:.1f}% fee)", [
+            ["Total PIP investment (reserves, not ongoing revenue)", f"${soft_pip_total:,.0f}"],
             ["Revenue increase needed", f"${be['delta_revenue']:,.0f}"],
             ["% increase over current revenue",
              f"{be['pct_increase']:.1f}%" if be["pct_increase"] is not None else "—"],
+            ["Current ADR", f"${current_adr:,.0f}"],
+            ["ADR needed (occupancy held flat)", f"${target_adr:,.0f}" if target_adr is not None else "—"],
+            ["ADR increase needed", (
+                f"+${adr_dollar_equiv:,.0f}" + (f" ({adr_pct_increase:.1f}%)" if adr_pct_increase is not None else "")
+            ) if adr_dollar_equiv is not None else "—"],
             ["Current occupancy", f"{current_occ:.1f}%"],
-            ["Occupancy needed", f"{target_occ:.1f}%" if target_occ is not None else "—"],
+            ["Occupancy needed (ADR held flat)", f"{target_occ:.1f}%" if target_occ is not None else "—"],
             ["Occupancy increase needed", (
                 f"+{occ_pp_equiv:.1f}pp" + (f" ({occ_pct_increase:.1f}%)" if occ_pct_increase is not None else "")
             ) if occ_pp_equiv is not None else "—"],
@@ -1642,6 +1793,7 @@ with tab_summary:
             ["Projected gross revenue", f"${projected_gross:,.0f}"],
             ["Projected revenue increase", _signed_dollars(projected_delta) + (
                 f" ({projected_pct:+.1f}%)" if projected_pct is not None else "")],
+            ["Projected ADR", f"${soft_base['adr']:,.0f}"],
             ["Projected occupancy", f"{soft_base['occupancy_pct']:.1f}%"],
             ["Projected net vs. current", f"${projected_net_vs_current:,.0f}"],
         ]),
@@ -1666,26 +1818,22 @@ with tab_summary:
 # ---------------------------------------------------------------------------
 with tab_exit:
     st.markdown("What would this property be worth at exit, using an income-capitalization approach: "
-                "**NOI = Gross revenue × (1 − OpEx%) − franchise fee − annualized PIP**, then "
+                "**NOI = Gross revenue × (1 − OpEx%) − franchise fee**, then "
                 "**Value = NOI ÷ Cap Rate**. The same OpEx% and cap rate are applied to every scenario, "
-                "so differences in value reflect differences in revenue, not a changing valuation assumption.")
+                "so differences in value reflect differences in revenue, not a changing valuation assumption. "
+                "PIP isn't part of this — it's funded upfront out of acquisition cash reserves, not out of "
+                "ongoing operations, so it doesn't reduce NOI or exit value here.")
 
     c1, c2 = st.columns(2)
     c1.slider("Operating expense ratio (% of gross revenue)", min_value=0.0, max_value=90.0, step=1.0,
               key="exit_opex_pct")
     c2.slider("Exit cap rate (%)", min_value=3.0, max_value=15.0, step=0.25, key="exit_cap_rate")
 
-    include_pip = st.checkbox("PIP expense included in OpEx", value=True, key="exit_pip_in_opex",
-                               help="Checked: NOI is reduced by the annualized PIP cost while it's still being "
-                                    "amortized (current behavior). Unchecked: NOI ignores PIP entirely, showing "
-                                    "the property's value from operations alone.")
-
     opex_pct = st.session_state["exit_opex_pct"]
     cap_rate = st.session_state["exit_cap_rate"]
 
     def _valuation(r):
-        pip_cost = r.get("pip_annual_cost", 0.0) if include_pip else 0.0
-        return compute_valuation(r["gross_revenue"], r["fee_cost"], pip_cost, opex_pct, cap_rate)
+        return compute_valuation(r["gross_revenue"], r["fee_cost"], opex_pct, cap_rate)
 
     valuation_rows = []
     for k in scenario_keys:
@@ -1744,8 +1892,8 @@ with tab_exit:
         records = []
         for k in scenario_keys:
             r = results[k]
-            for i, (gross, fee, pip_annual) in enumerate(scenario_yearly_series(r, years=15), start=1):
-                _, value = compute_valuation(gross, fee, pip_annual if include_pip else 0.0, opex_pct, cap_rate)
+            for i, (gross, fee) in enumerate(scenario_yearly_series(r, years=15), start=1):
+                _, value = compute_valuation(gross, fee, opex_pct, cap_rate)
                 records.append({"Year": i, "Value": value, "Scenario": r["label"]})
         df_trend = pd.DataFrame(records)
         line = alt.Chart(df_trend).mark_line(point=True).encode(
@@ -1761,3 +1909,94 @@ with tab_exit:
                "here; in reality, brand affiliation can itself affect the cap rate a buyer would apply (flagged "
                "properties sometimes trade at tighter cap rates due to financing/brand-recognition effects), "
                "which isn't modeled — you can approximate that by re-running this tab at a different cap rate.")
+
+    st.divider()
+
+    # ---------------------------------------------------------------------------
+    # Total return — cumulative operating cash flow (NOI, banked each year)
+    # plus the terminal exit value, instead of the walk-away sale price alone.
+    # Exit value only answers "what could I sell for in year N" — it ignores
+    # the cash already collected getting there. A flag scenario can show a
+    # lower exit value for years (the franchise fee taxes NOI margin every
+    # year) while still running ahead once you credit the cash banked along
+    # the way, which is what this adds.
+    # ===========================================================================
+    st.markdown("#### Total return (cumulative cash flow + exit value)")
+    st.markdown("**Total return = cumulative NOI banked from Year 1 through Year N, plus the exit value at Year N** "
+                "— crediting operating cash flow collected during the hold, not just the terminal sale price.")
+
+    def _cumulative_cash_flow_series(r):
+        cum, running = [], 0.0
+        for gross, fee in scenario_yearly_series(r, years=15):
+            noi, _ = compute_valuation(gross, fee, opex_pct, cap_rate)
+            running += noi
+            cum.append(running)
+        return cum
+
+    def _total_return_series(r):
+        cum_cf = _cumulative_cash_flow_series(r)
+        totals = []
+        for i, (gross, fee) in enumerate(scenario_yearly_series(r, years=15)):
+            _, value = compute_valuation(gross, fee, opex_pct, cap_rate)
+            totals.append(cum_cf[i] + value)
+        return totals
+
+    total_return_yr10 = {k: _total_return_series(results[k])[9] for k in scenario_keys}
+    baseline_total_return = total_return_yr10["stay_independent"]
+    best_tr_key = max(scenario_keys, key=lambda k: total_return_yr10[k])
+    best_tr = results[best_tr_key]
+
+    if best_tr_key == "stay_independent":
+        tr_verdict = (f"By Year 10, staying independent has the highest total return at "
+                      f"${baseline_total_return:,.0f} — no flag scenario, even crediting cash collected along "
+                      f"the way, beats it.")
+    else:
+        tr_verdict = (f"By Year 10, **{best_tr['label']}** has the highest total return at "
+                      f"${total_return_yr10[best_tr_key]:,.0f}, ${total_return_yr10[best_tr_key] - baseline_total_return:,.0f} "
+                      f"above staying independent (${baseline_total_return:,.0f}) once cash collected along the "
+                      f"way is credited, not just the terminal sale price.")
+
+    st.markdown(
+        f"""<div style="background:#1C2D4E;border:1px solid #2A3D63;border-radius:10px;padding:1rem 1.25rem;margin:0.75rem 0 1.25rem;">
+        {tr_verdict}</div>""",
+        unsafe_allow_html=True,
+    )
+
+    col3, col4 = st.columns(2)
+    with col3:
+        df_tr = pd.DataFrame({
+            "Scenario": labels_order,
+            "Total return": [total_return_yr10[k] for k in scenario_keys],
+        })
+        tr_bars = alt.Chart(df_tr).mark_bar().encode(
+            x=alt.X("Scenario:N", sort=labels_order, title=None, axis=alt.Axis(labelAngle=-35)),
+            y=alt.Y("Total return:Q", title="Total return ($)"),
+            color=alt.Color("Scenario:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
+            tooltip=["Scenario", alt.Tooltip("Total return:Q", format="$,.0f")],
+        )
+        tr_rule = alt.Chart(pd.DataFrame({"y": [baseline_total_return]})).mark_rule(
+            color="#C9A84C", strokeDash=[5, 4], size=2
+        ).encode(y="y:Q")
+        st.altair_chart((tr_bars + tr_rule).properties(height=420, title="Year 10 total return by scenario"),
+                         width="stretch")
+
+    with col4:
+        tr_records = []
+        for k in scenario_keys:
+            r = results[k]
+            series = _total_return_series(r)
+            for i, total in enumerate(series, start=1):
+                tr_records.append({"Year": i, "Total return": total, "Scenario": r["label"]})
+        df_tr_trend = pd.DataFrame(tr_records)
+        tr_line = alt.Chart(df_tr_trend).mark_line(point=True).encode(
+            x=alt.X("Year:Q", title="Years since conversion"),
+            y=alt.Y("Total return:Q", title="Total return ($)"),
+            color=alt.Color("Scenario:N", scale=alt.Scale(domain=color_domain, range=color_range), title="Scenario"),
+            tooltip=["Scenario", "Year", alt.Tooltip("Total return:Q", format="$,.0f")],
+        )
+        st.altair_chart(tr_line.properties(height=420, title="Total return over time by scenario"), width="stretch")
+
+    st.caption("Cumulative cash flow uses NOI (Gross revenue × (1 − OpEx%) − franchise fee) summed year by year, "
+               "then adds the exit value at that same year. Stay Independent's cash flow is flat (no growth "
+               "modeled), so its total return grows in a straight line — a lower exit value elsewhere doesn't "
+               "necessarily mean a lower total return once the cash already banked is counted.")
